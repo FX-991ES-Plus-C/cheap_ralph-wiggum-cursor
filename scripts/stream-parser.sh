@@ -8,8 +8,8 @@
 #   cursor-agent -p --force --output-format stream-json "..." | ./stream-parser.sh /path/to/workspace
 #
 # Outputs to stdout:
-#   - ROTATE when threshold hit (80k tokens)
-#   - WARN when approaching limit (70k tokens)
+#   - ROTATE when threshold hit (200k tokens)
+#   - WARN when approaching limit (170k tokens)
 #   - GUTTER when stuck pattern detected
 #   - COMPLETE when agent outputs <ralph>COMPLETE</ralph>
 #
@@ -26,8 +26,12 @@ RALPH_DIR="$WORKSPACE/.ralph"
 mkdir -p "$RALPH_DIR"
 
 # Thresholds
-WARN_THRESHOLD=70000
-ROTATE_THRESHOLD=80000
+WARN_THRESHOLD=170000
+ROTATE_THRESHOLD=200000
+LARGE_READ_THRESHOLD_BYTES="${LARGE_READ_THRESHOLD_BYTES:-81920}"
+VERY_LARGE_READ_THRESHOLD_BYTES="${VERY_LARGE_READ_THRESHOLD_BYTES:-262144}"
+MAX_LARGE_REREADS_PER_FILE="${MAX_LARGE_REREADS_PER_FILE:-3}"
+MAX_LARGE_READS_WITHOUT_WRITE="${MAX_LARGE_READS_WITHOUT_WRITE:-5}"
 
 # Tracking state
 BYTES_READ=0
@@ -37,6 +41,19 @@ SHELL_OUTPUT_CHARS=0
 PROMPT_CHARS=0
 TOOL_CALLS=0
 WARN_SENT=0
+READ_CALLS=0
+WRITE_CALLS=0
+WORK_WRITE_CALLS=0
+SHELL_CALLS=0
+LARGE_READS=0
+LARGE_READ_REREADS=0
+TERMINAL_SIGNAL_SENT=0
+ROTATE_SENT=0
+GUTTER_SENT=0
+COMPLETE_SENT=0
+DEFER_SENT=0
+LAST_SIGNAL="NONE"
+LARGE_READ_THRASH_HIT=0
 
 # Estimate initial prompt size (Ralph prompt is ~2KB + file references)
 PROMPT_CHARS=3000
@@ -44,7 +61,8 @@ PROMPT_CHARS=3000
 # Gutter detection - use temp files instead of associative arrays (macOS bash 3.x compat)
 FAILURES_FILE=$(mktemp)
 WRITES_FILE=$(mktemp)
-trap "rm -f $FAILURES_FILE $WRITES_FILE" EXIT
+READS_FILE=$(mktemp)
+trap "rm -f $FAILURES_FILE $WRITES_FILE $READS_FILE" EXIT
 
 # Get context health emoji
 get_health_emoji() {
@@ -63,6 +81,53 @@ get_health_emoji() {
 calc_tokens() {
   local total_bytes=$((PROMPT_CHARS + BYTES_READ + BYTES_WRITTEN + ASSISTANT_CHARS + SHELL_OUTPUT_CHARS))
   echo $((total_bytes / 4))
+}
+
+emit_signal_once() {
+  local signal="$1"
+  local activity_message="${2:-}"
+  local error_message="${3:-}"
+
+  if [[ $TERMINAL_SIGNAL_SENT -eq 1 ]] && [[ "$LAST_SIGNAL" != "$signal" ]]; then
+    return
+  fi
+
+  case "$signal" in
+    "ROTATE")
+      [[ $ROTATE_SENT -eq 1 ]] && return
+      ROTATE_SENT=1
+      TERMINAL_SIGNAL_SENT=1
+      ;;
+    "GUTTER")
+      [[ $GUTTER_SENT -eq 1 ]] && return
+      GUTTER_SENT=1
+      TERMINAL_SIGNAL_SENT=1
+      ;;
+    "COMPLETE")
+      [[ $COMPLETE_SENT -eq 1 ]] && return
+      COMPLETE_SENT=1
+      TERMINAL_SIGNAL_SENT=1
+      ;;
+    "DEFER")
+      [[ $DEFER_SENT -eq 1 ]] && return
+      DEFER_SENT=1
+      TERMINAL_SIGNAL_SENT=1
+      ;;
+    *)
+      ;;
+  esac
+
+  if [[ -n "$activity_message" ]]; then
+    log_activity "$activity_message"
+  fi
+
+  if [[ -n "$error_message" ]]; then
+    log_error "$error_message"
+  fi
+
+  LAST_SIGNAL="$signal"
+  write_session_metrics
+  echo "$signal" 2>/dev/null || true
 }
 
 # Log to activity.log
@@ -138,11 +203,14 @@ is_retryable_api_error() {
 # Check for gutter conditions
 check_gutter() {
   local tokens=$(calc_tokens)
+
+  if [[ $TERMINAL_SIGNAL_SENT -eq 1 ]]; then
+    return
+  fi
   
   # Check rotation threshold
   if [[ $tokens -ge $ROTATE_THRESHOLD ]]; then
-    log_activity "ROTATE: Token threshold reached ($tokens >= $ROTATE_THRESHOLD)"
-    echo "ROTATE" 2>/dev/null || true
+    emit_signal_once "ROTATE" "ROTATE: Token threshold reached ($tokens >= $ROTATE_THRESHOLD)"
     return
   fi
   
@@ -160,17 +228,16 @@ track_shell_failure() {
   local exit_code="$2"
   
   if [[ $exit_code -ne 0 ]]; then
-    # Count failures for this command (grep -c exits 1 if no match, so use || true)
+    # Count failures for this command
     local count
-    count=$(grep -c "^${cmd}$" "$FAILURES_FILE" 2>/dev/null) || count=0
+    count=$(grep -Fxc -- "$cmd" "$FAILURES_FILE" 2>/dev/null) || count=0
     count=$((count + 1))
     echo "$cmd" >> "$FAILURES_FILE"
     
     log_error "SHELL FAIL: $cmd → exit $exit_code (attempt $count)"
     
     if [[ $count -ge 3 ]]; then
-      log_error "⚠️ GUTTER: same command failed ${count}x"
-      echo "GUTTER" 2>/dev/null || true
+      emit_signal_once "GUTTER" "" "⚠️ GUTTER: same command failed ${count}x"
     fi
   fi
 }
@@ -192,9 +259,83 @@ track_file_write() {
   
   # Check for thrashing (5+ writes in 10 minutes)
   if [[ $count -ge 5 ]]; then
-    log_error "⚠️ THRASHING: $path written ${count}x in 10 min"
-    echo "GUTTER" 2>/dev/null || true
+    emit_signal_once "GUTTER" "" "⚠️ THRASHING: $path written ${count}x in 10 min"
   fi
+}
+
+track_file_read() {
+  local path="$1"
+  local bytes="$2"
+  local lines="$3"
+  local now=$(date +%s)
+
+  READ_CALLS=$((READ_CALLS + 1))
+  printf '%s\t%s\t%s\t%s\n' "$now" "$path" "$bytes" "$lines" >> "$READS_FILE"
+
+  if [[ $bytes -lt $LARGE_READ_THRESHOLD_BYTES ]]; then
+    return
+  fi
+
+  LARGE_READS=$((LARGE_READS + 1))
+
+  local per_file_count
+  per_file_count=$(awk -F '\t' -v path="$path" '
+    $2 == path { count++ }
+    END { print count+0 }
+  ' "$READS_FILE")
+
+  if [[ $per_file_count -ge 2 ]]; then
+    LARGE_READ_REREADS=$((LARGE_READ_REREADS + 1))
+  fi
+
+  if [[ $WRITE_CALLS -eq 0 && $bytes -ge $VERY_LARGE_READ_THRESHOLD_BYTES && $per_file_count -ge 2 ]]; then
+    LARGE_READ_THRASH_HIT=1
+    emit_signal_once \
+      "GUTTER" \
+      "🚨 THRASH: very large file reread of $path (${per_file_count}x before any write)" \
+      "⚠️ THRASH: very large file $path reread ${per_file_count}x before any write"
+    return
+  fi
+
+  if [[ $WRITE_CALLS -eq 0 && $per_file_count -ge $MAX_LARGE_REREADS_PER_FILE ]]; then
+    LARGE_READ_THRASH_HIT=1
+    emit_signal_once \
+      "GUTTER" \
+      "🚨 THRASH: repeated large reread of $path (${per_file_count}x before any write)" \
+      "⚠️ THRASH: $path reread ${per_file_count}x in one session before any write"
+    return
+  fi
+
+  if [[ $WRITE_CALLS -eq 0 && $LARGE_READS -ge $MAX_LARGE_READS_WITHOUT_WRITE ]]; then
+    LARGE_READ_THRASH_HIT=1
+    emit_signal_once \
+      "GUTTER" \
+      "🚨 THRASH: ${LARGE_READS} large reads without any write this session" \
+      "⚠️ THRASH: ${LARGE_READS} large reads occurred before any write"
+  fi
+}
+
+write_session_metrics() {
+  local summary_file="$RALPH_DIR/.last-session.env"
+  local tokens
+  tokens=$(calc_tokens)
+
+  cat > "$summary_file" <<EOF
+RALPH_SESSION_SIGNAL=${LAST_SIGNAL:-NONE}
+RALPH_SESSION_TOKENS=$tokens
+RALPH_SESSION_BYTES_READ=$BYTES_READ
+RALPH_SESSION_BYTES_WRITTEN=$BYTES_WRITTEN
+RALPH_SESSION_ASSISTANT_CHARS=$ASSISTANT_CHARS
+RALPH_SESSION_SHELL_OUTPUT_CHARS=$SHELL_OUTPUT_CHARS
+RALPH_SESSION_TOOL_CALLS=$TOOL_CALLS
+RALPH_SESSION_READ_CALLS=$READ_CALLS
+RALPH_SESSION_WRITE_CALLS=$WRITE_CALLS
+RALPH_SESSION_WORK_WRITE_CALLS=$WORK_WRITE_CALLS
+RALPH_SESSION_SHELL_CALLS=$SHELL_CALLS
+RALPH_SESSION_LARGE_READS=$LARGE_READS
+RALPH_SESSION_LARGE_READ_REREADS=$LARGE_READ_REREADS
+RALPH_SESSION_LARGE_READ_THRASH_HIT=$LARGE_READ_THRASH_HIT
+EOF
 }
 
 # Process a single JSON line from stream
@@ -227,10 +368,9 @@ process_line() {
       # Check if this is a retryable error (rate limit, network, etc.)
       if is_retryable_api_error "$error_msg"; then
         log_error "⚠️ RETRYABLE: Error may be transient (rate limit/network)"
-        echo "DEFER" 2>/dev/null || true
+        emit_signal_once "DEFER"
       else
-        log_error "🚨 NON-RETRYABLE: Error requires attention"
-        echo "GUTTER" 2>/dev/null || true
+        emit_signal_once "GUTTER" "❌ API ERROR: non-retryable failure" "🚨 NON-RETRYABLE: Error requires attention"
       fi
       ;;
       
@@ -243,14 +383,12 @@ process_line() {
         
         # Check for completion sigil
         if [[ "$text" == *"<ralph>COMPLETE</ralph>"* ]]; then
-          log_activity "✅ Agent signaled COMPLETE"
-          echo "COMPLETE" 2>/dev/null || true
+          emit_signal_once "COMPLETE" "✅ Agent signaled COMPLETE"
         fi
         
         # Check for gutter sigil
         if [[ "$text" == *"<ralph>GUTTER</ralph>"* ]]; then
-          log_activity "🚨 Agent signaled GUTTER (stuck)"
-          echo "GUTTER" 2>/dev/null || true
+          emit_signal_once "GUTTER" "🚨 Agent signaled GUTTER (stuck)"
         fi
       fi
       ;;
@@ -276,6 +414,7 @@ process_line() {
           
           local kb=$(echo "scale=1; $bytes / 1024" | bc 2>/dev/null || echo "$((bytes / 1024))")
           log_activity "READ $path ($lines lines, ~${kb}KB)"
+          track_file_read "$path" "$bytes" "$lines"
           
         # Handle write tool completion
         elif echo "$line" | jq -e '.tool_call.writeToolCall.result.success' > /dev/null 2>&1; then
@@ -283,6 +422,10 @@ process_line() {
           local lines=$(echo "$line" | jq -r '.tool_call.writeToolCall.result.success.linesCreated // 0' 2>/dev/null) || lines=0
           local bytes=$(echo "$line" | jq -r '.tool_call.writeToolCall.result.success.fileSize // 0' 2>/dev/null) || bytes=0
           BYTES_WRITTEN=$((BYTES_WRITTEN + bytes))
+          WRITE_CALLS=$((WRITE_CALLS + 1))
+          if [[ "$path" != "$RALPH_DIR/"* ]] && [[ "$path" != ".ralph/"* ]]; then
+            WORK_WRITE_CALLS=$((WORK_WRITE_CALLS + 1))
+          fi
           
           local kb=$(echo "scale=1; $bytes / 1024" | bc 2>/dev/null || echo "$((bytes / 1024))")
           log_activity "WRITE $path ($lines lines, ${kb}KB)"
@@ -294,6 +437,7 @@ process_line() {
         elif echo "$line" | jq -e '.tool_call.shellToolCall.result' > /dev/null 2>&1; then
           local cmd=$(echo "$line" | jq -r '.tool_call.shellToolCall.args.command // "unknown"' 2>/dev/null) || cmd="unknown"
           local exit_code=$(echo "$line" | jq -r '.tool_call.shellToolCall.result.exitCode // 0' 2>/dev/null) || exit_code=0
+          SHELL_CALLS=$((SHELL_CALLS + 1))
           
           local stdout=$(echo "$line" | jq -r '.tool_call.shellToolCall.result.stdout // ""' 2>/dev/null) || stdout=""
           local stderr=$(echo "$line" | jq -r '.tool_call.shellToolCall.result.stderr // ""' 2>/dev/null) || stderr=""
@@ -347,6 +491,8 @@ main() {
     fi
   done
   
+  log_activity "SESSION SUMMARY: reads=$READ_CALLS writes=$WRITE_CALLS work_writes=$WORK_WRITE_CALLS shell=$SHELL_CALLS large_reads=$LARGE_READS large_rereads=$LARGE_READ_REREADS signal=${LAST_SIGNAL:-NONE}"
+  write_session_metrics
   # Final token status
   log_token_status
 }

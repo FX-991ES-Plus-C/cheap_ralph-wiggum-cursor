@@ -24,11 +24,34 @@ fi
 # =============================================================================
 
 # Token thresholds
-WARN_THRESHOLD="${WARN_THRESHOLD:-70000}"
-ROTATE_THRESHOLD="${ROTATE_THRESHOLD:-80000}"
+WARN_THRESHOLD="${WARN_THRESHOLD:-170000}"
+ROTATE_THRESHOLD="${ROTATE_THRESHOLD:-200000}"
 
 # Iteration limits
 MAX_ITERATIONS="${MAX_ITERATIONS:-20}"
+
+# Long-run log compaction
+AUTO_ROTATE_LOGS="${AUTO_ROTATE_LOGS:-true}"
+PROGRESS_ROTATE_MAX_BYTES="${PROGRESS_ROTATE_MAX_BYTES:-32768}"
+PROGRESS_ROTATE_MAX_LINES="${PROGRESS_ROTATE_MAX_LINES:-400}"
+ACTIVITY_ROTATE_MAX_BYTES="${ACTIVITY_ROTATE_MAX_BYTES:-262144}"
+ACTIVITY_ROTATE_MAX_LINES="${ACTIVITY_ROTATE_MAX_LINES:-2500}"
+
+# Anti-thrash / self-management
+LARGE_READ_THRESHOLD_BYTES="${LARGE_READ_THRESHOLD_BYTES:-81920}"
+VERY_LARGE_READ_THRESHOLD_BYTES="${VERY_LARGE_READ_THRESHOLD_BYTES:-262144}"
+MAX_LARGE_REREADS_PER_FILE="${MAX_LARGE_REREADS_PER_FILE:-3}"
+MAX_LARGE_READS_WITHOUT_WRITE="${MAX_LARGE_READS_WITHOUT_WRITE:-5}"
+MAX_THRASH_ROTATIONS="${MAX_THRASH_ROTATIONS:-3}"
+SESSION_BRIEF_MAX_DIRTY_FILES="${SESSION_BRIEF_MAX_DIRTY_FILES:-8}"
+SESSION_BRIEF_MAX_ERROR_LINES="${SESSION_BRIEF_MAX_ERROR_LINES:-6}"
+SESSION_BRIEF_MAX_LARGE_FILES="${SESSION_BRIEF_MAX_LARGE_FILES:-8}"
+SESSION_BRIEF_EXCLUDE_REGEX="${SESSION_BRIEF_EXCLUDE_REGEX:-(^|/)(\\.git|node_modules|vendor|vendors|third_party|third-party|dist|build|coverage|\\.next|target|test-results|\\.ralph/archive)(/|$)|\\.min\\.(js|css|mjs)$}"
+
+# Sequential run locking
+SEQUENTIAL_LOCK_DIR="${SEQUENTIAL_LOCK_DIR:-.ralph/locks/sequential.lock}"
+LOCK_STALE_MINUTES="${LOCK_STALE_MINUTES:-45}"
+SEQUENTIAL_LOCK_HELD="${SEQUENTIAL_LOCK_HELD:-}"
 
 # Model selection
 DEFAULT_MODEL="opus-4.5-thinking"
@@ -113,6 +136,37 @@ get_health_emoji() {
   fi
 }
 
+# Get current git HEAD if available
+get_git_head() {
+  git rev-parse HEAD 2>/dev/null || echo ""
+}
+
+# Read parser-produced session metrics into namespaced shell variables
+load_last_session_metrics() {
+  local workspace="${1:-.}"
+  local summary_file="$workspace/.ralph/.last-session.env"
+
+  RALPH_SESSION_SIGNAL="NONE"
+  RALPH_SESSION_TOKENS=0
+  RALPH_SESSION_BYTES_READ=0
+  RALPH_SESSION_BYTES_WRITTEN=0
+  RALPH_SESSION_ASSISTANT_CHARS=0
+  RALPH_SESSION_SHELL_OUTPUT_CHARS=0
+  RALPH_SESSION_TOOL_CALLS=0
+  RALPH_SESSION_READ_CALLS=0
+  RALPH_SESSION_WRITE_CALLS=0
+  RALPH_SESSION_WORK_WRITE_CALLS=0
+  RALPH_SESSION_SHELL_CALLS=0
+  RALPH_SESSION_LARGE_READS=0
+  RALPH_SESSION_LARGE_READ_REREADS=0
+  RALPH_SESSION_LARGE_READ_THRASH_HIT=0
+
+  if [[ -f "$summary_file" ]]; then
+    # shellcheck disable=SC1090
+    source "$summary_file"
+  fi
+}
+
 # =============================================================================
 # LOGGING
 # =============================================================================
@@ -152,6 +206,671 @@ log_progress() {
 }
 
 # =============================================================================
+# LOG COMPACTION
+# =============================================================================
+
+# Get file size in bytes (cross-platform)
+get_file_size_bytes() {
+  local file="$1"
+  if [[ ! -f "$file" ]]; then
+    echo "0"
+    return
+  fi
+
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    stat -f '%z' "$file" 2>/dev/null || wc -c < "$file"
+  else
+    stat -c '%s' "$file" 2>/dev/null || wc -c < "$file"
+  fi
+}
+
+# Get file line count
+get_file_line_count() {
+  local file="$1"
+  if [[ ! -f "$file" ]]; then
+    echo "0"
+    return
+  fi
+
+  wc -l < "$file" | tr -d '[:space:]'
+}
+
+# Return success when a log file should be compacted
+should_rotate_log_file() {
+  local file="$1"
+  local max_bytes="$2"
+  local max_lines="$3"
+
+  [[ ! -f "$file" ]] && return 1
+
+  local bytes lines
+  bytes=$(get_file_size_bytes "$file")
+  lines=$(get_file_line_count "$file")
+
+  [[ "$bytes" -ge "$max_bytes" || "$lines" -ge "$max_lines" ]]
+}
+
+# Ensure the archive directory exists
+ensure_ralph_archive_dir() {
+  local workspace="$1"
+  local archive_dir="$workspace/.ralph/archive"
+  mkdir -p "$archive_dir"
+  echo "$archive_dir"
+}
+
+# Timestamp used for archive file names
+make_rotation_stamp() {
+  date '+%Y%m%d-%H%M%S'
+}
+
+# Extract checkbox descriptions from RALPH_TASK.md by status
+list_task_descriptions() {
+  local workspace="$1"
+  local status="$2"
+  local task_file="$workspace/RALPH_TASK.md"
+  local pattern=""
+
+  [[ ! -f "$task_file" ]] && return
+
+  case "$status" in
+    completed)
+      pattern='^[[:space:]]*([-*]|[0-9]+\.)[[:space:]]+\[[xX]\][[:space:]]+'
+      ;;
+    pending)
+      pattern='^[[:space:]]*([-*]|[0-9]+\.)[[:space:]]+\[ \][[:space:]]+'
+      ;;
+    *)
+      return
+      ;;
+  esac
+
+  grep -E "$pattern" "$task_file" 2>/dev/null \
+    | sed -E 's/^[[:space:]]*([-*]|[0-9]+\.)[[:space:]]+\[[xX ]\][[:space:]]+//' \
+    | sed -E 's/[[:space:]]*<!--[[:space:]]*group:[[:space:]]*[0-9]+[[:space:]]*-->[[:space:]]*$//'
+}
+
+# Write a compact task snapshot to a file
+write_task_snapshot_section() {
+  local output_file="$1"
+  local workspace="$2"
+  local heading="${3:-## Task Snapshot}"
+  local counts done_count total_count remaining_count
+  local completed_sample pending_sample
+
+  counts=$(count_criteria "$workspace")
+  done_count="${counts%%:*}"
+  total_count="${counts##*:}"
+
+  [[ "$done_count" =~ ^[0-9]+$ ]] || done_count=0
+  [[ "$total_count" =~ ^[0-9]+$ ]] || total_count=0
+  remaining_count=$((total_count - done_count))
+  if [[ "$remaining_count" -lt 0 ]]; then
+    remaining_count=0
+  fi
+
+  completed_sample=$(list_task_descriptions "$workspace" completed | tail -n 6)
+  pending_sample=$(list_task_descriptions "$workspace" pending | head -n 6)
+
+  {
+    echo "$heading"
+    echo ""
+    echo "- Generated: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "- Criteria: $done_count / $total_count complete ($remaining_count remaining)"
+  } >> "$output_file"
+
+  if [[ -n "$completed_sample" ]]; then
+    {
+      echo ""
+      echo "### Already Completed (sample)"
+      while IFS= read -r item; do
+        [[ -n "$item" ]] && echo "- $item"
+      done <<< "$completed_sample"
+    } >> "$output_file"
+  fi
+
+  if [[ -n "$pending_sample" ]]; then
+    {
+      echo ""
+      echo "### Next Unchecked Criteria"
+      while IFS= read -r item; do
+        [[ -n "$item" ]] && echo "- $item"
+      done <<< "$pending_sample"
+    } >> "$output_file"
+  fi
+}
+
+# Return success if a file is likely text and worth surfacing in the brief
+is_probably_text_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  LC_ALL=C grep -Iq . "$file" 2>/dev/null
+}
+
+should_exclude_brief_candidate() {
+  local relative_path="$1"
+  [[ "$relative_path" =~ $SESSION_BRIEF_EXCLUDE_REGEX ]]
+}
+
+# Enumerate repo files in a repo-agnostic way, preferring git when available
+list_repo_candidate_files() {
+  local workspace="$1"
+
+  if git -C "$workspace" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    (
+      cd "$workspace" || exit 1
+      git ls-files
+      git ls-files --others --exclude-standard
+    ) | awk '!seen[$0]++'
+    return
+  fi
+
+  if command -v rg >/dev/null 2>&1; then
+    (
+      cd "$workspace" || exit 1
+      rg --files -g '!node_modules' -g '!.git' -g '!dist' -g '!build' -g '!coverage' \
+        -g '!.next' -g '!target' -g '!vendor' -g '!test-results' -g '!.ralph/archive'
+    ) | awk '!seen[$0]++'
+    return
+  fi
+
+  find "$workspace" \
+    \( -path "$workspace/.git" -o -path "$workspace/node_modules" -o -path "$workspace/dist" \
+       -o -path "$workspace/build" -o -path "$workspace/coverage" -o -path "$workspace/.next" \
+       -o -path "$workspace/target" -o -path "$workspace/vendor" -o -path "$workspace/test-results" \
+       -o -path "$workspace/.ralph/archive" \) -prune \
+    -o -type f -print 2>/dev/null | awk '!seen[$0]++'
+}
+
+# List the largest text/context files that should be sliced before full reads
+list_large_context_files() {
+  local workspace="$1"
+  local threshold="${2:-$LARGE_READ_THRESHOLD_BYTES}"
+  local max_files="${3:-$SESSION_BRIEF_MAX_LARGE_FILES}"
+
+  {
+    [[ -f "$workspace/RALPH_TASK.md" ]] && printf '%s\n' "RALPH_TASK.md"
+    [[ -f "$workspace/.ralph/session-brief.md" ]] && printf '%s\n' ".ralph/session-brief.md"
+    [[ -f "$workspace/.ralph/guardrails.md" ]] && printf '%s\n' ".ralph/guardrails.md"
+    list_repo_candidate_files "$workspace"
+  } | awk '!seen[$0]++' | while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+
+    local file="$entry"
+    if [[ "$entry" != "$workspace/"* ]] && [[ "$entry" != /* ]]; then
+      file="$workspace/$entry"
+    fi
+
+    [[ -f "$file" ]] || continue
+    local relative="${file#$workspace/}"
+    [[ "$relative" != "$file" ]] || relative="$file"
+    should_exclude_brief_candidate "$relative" && continue
+    is_probably_text_file "$file" || continue
+
+    local size lines
+    size=$(get_file_size_bytes "$file")
+    [[ "$size" -ge "$threshold" ]] || continue
+    lines=$(get_file_line_count "$file")
+    printf '%s\t%s\t%s\n' "$size" "$lines" "$relative"
+  done | sort -nr -k1,1 | head -n "$max_files"
+}
+
+append_task_slice_section() {
+  local output_file="$1"
+  local workspace="$2"
+  local line_number="$3"
+  local task_file="$workspace/RALPH_TASK.md"
+  local start_line end_line
+
+  [[ -f "$task_file" ]] || return
+  [[ "$line_number" =~ ^[0-9]+$ ]] || return
+
+  start_line=$((line_number - 3))
+  end_line=$((line_number + 6))
+  if [[ "$start_line" -lt 1 ]]; then
+    start_line=1
+  fi
+
+  {
+    echo "## Task Slice"
+    echo ""
+    echo '```md'
+    sed -n "${start_line},${end_line}p" "$task_file"
+    echo '```'
+    echo ""
+  } >> "$output_file"
+}
+
+# Generate a concise, structured restart brief for weaker/cheaper models
+write_session_brief() {
+  local workspace="$1"
+  local brief_file="$workspace/.ralph/session-brief.md"
+  local counts done_count total_count remaining_count
+  local next_task next_id next_status next_desc next_line=""
+  local pending_sample completed_sample dirty_files recent_errors large_files carried_notes
+
+  counts=$(count_criteria "$workspace")
+  done_count="${counts%%:*}"
+  total_count="${counts##*:}"
+
+  [[ "$done_count" =~ ^[0-9]+$ ]] || done_count=0
+  [[ "$total_count" =~ ^[0-9]+$ ]] || total_count=0
+  remaining_count=$((total_count - done_count))
+  if [[ "$remaining_count" -lt 0 ]]; then
+    remaining_count=0
+  fi
+
+  next_task=$(get_next_task_info "$workspace")
+  if [[ -n "$next_task" ]]; then
+    IFS='|' read -r next_id next_status next_desc <<< "$next_task"
+    if [[ "$next_id" =~ ^line_([0-9]+)$ ]]; then
+      next_line="${BASH_REMATCH[1]}"
+    fi
+  fi
+
+  pending_sample=$(list_task_descriptions "$workspace" pending | head -n 5)
+  completed_sample=$(list_task_descriptions "$workspace" completed | tail -n 4)
+  dirty_files=$(git -C "$workspace" status --short --untracked-files=all 2>/dev/null | head -n "$SESSION_BRIEF_MAX_DIRTY_FILES")
+  recent_errors=$(grep -vE '^(#|>|$)' "$workspace/.ralph/errors.log" 2>/dev/null | tail -n "$SESSION_BRIEF_MAX_ERROR_LINES")
+  large_files=$(list_large_context_files "$workspace")
+
+  if [[ -f "$workspace/.ralph/progress.md" ]]; then
+    carried_notes=$(extract_progress_keep_block "$workspace/.ralph/progress.md" \
+      | grep -E '^[[:space:]]*-' \
+      | sed -E 's/^[[:space:]]*-[[:space:]]+//' \
+      | head -n 8)
+  else
+    carried_notes=""
+  fi
+
+  {
+    echo "# Ralph Session Brief"
+    echo ""
+    echo "> Auto-generated before each iteration. Read this first."
+    echo ""
+    echo "- Generated: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "- Criteria: $done_count / $total_count complete ($remaining_count remaining)"
+    if [[ -n "$next_desc" ]]; then
+      echo "- Next unchecked criterion: $next_desc"
+    fi
+    if [[ -n "$next_line" ]]; then
+      echo "- RALPH_TASK target line: $next_line"
+      echo "- Read strategy: open \`RALPH_TASK.md\` around line $next_line first instead of reading the whole file."
+    else
+      echo "- Read strategy: use the next unchecked checkbox in \`RALPH_TASK.md\` as the starting point."
+    fi
+    echo ""
+
+    if [[ -n "$carried_notes" ]]; then
+      echo "## Carried Forward Notes"
+      echo ""
+      while IFS= read -r item; do
+        [[ -n "$item" ]] && echo "- $item"
+      done <<< "$carried_notes"
+      echo ""
+    fi
+
+    echo "## Hard Rules"
+    echo ""
+    echo "- Do not full-read \`.ralph/progress.md\` if the carried-forward notes here already answer your question."
+    echo "- Do not full-read files listed under \"Large Files To Slice First\" until you have narrowed to a symbol or line range."
+    echo "- If you reread the same huge file twice before writing code, you are stuck: switch to \`rg -n\` / \`sed -n\` or move on."
+    echo ""
+
+    echo "## Immediate Focus"
+    echo ""
+    if [[ -n "$next_desc" ]]; then
+      echo "- Start with: $next_desc"
+    else
+      echo "- Start with the next unchecked criterion in \`RALPH_TASK.md\`."
+    fi
+    echo "- Prefer narrow reads (\`rg -n\`, \`wc -l\`, \`sed -n\`) before full-reading large files."
+    echo "- If you have not written code yet, do not reread the same large file repeatedly."
+    echo ""
+
+    if [[ -n "$pending_sample" ]]; then
+      echo "## Next Up"
+      echo ""
+      while IFS= read -r item; do
+        [[ -n "$item" ]] && echo "- $item"
+      done <<< "$pending_sample"
+      echo ""
+    fi
+
+    if [[ -n "$completed_sample" ]]; then
+      echo "## Recently Completed"
+      echo ""
+      while IFS= read -r item; do
+        [[ -n "$item" ]] && echo "- $item"
+      done <<< "$completed_sample"
+      echo ""
+    fi
+
+    echo "## Working Tree"
+    echo ""
+    if [[ -n "$dirty_files" ]]; then
+      while IFS= read -r item; do
+        [[ -n "$item" ]] && echo "- $item"
+      done <<< "$dirty_files"
+    else
+      echo "- Working tree currently clean."
+    fi
+    echo ""
+
+    if [[ -n "$recent_errors" ]]; then
+      echo "## Recent Failures / Warnings"
+      echo ""
+      while IFS= read -r item; do
+        [[ -n "$item" ]] && echo "- $item"
+      done <<< "$recent_errors"
+      echo ""
+    fi
+
+    if [[ -n "$large_files" ]]; then
+      echo "## Large Files To Slice First"
+      echo ""
+      while IFS=$'\t' read -r bytes lines path; do
+        [[ -n "$path" ]] || continue
+        echo "- $path (~$((bytes / 1024))KB, $lines lines)"
+      done <<< "$large_files"
+      echo ""
+    fi
+  } > "$brief_file"
+
+  if [[ -n "$next_line" ]]; then
+    append_task_slice_section "$brief_file" "$workspace" "$next_line"
+  fi
+}
+
+# Extract the preserved top block from progress.md
+extract_progress_keep_block() {
+  local progress_file="$1"
+
+  if grep -q '^<!-- RALPH_COMPACT_KEEP_START -->$' "$progress_file" 2>/dev/null && \
+     grep -q '^<!-- RALPH_COMPACT_KEEP_END -->$' "$progress_file" 2>/dev/null; then
+    awk '
+      /^<!-- RALPH_COMPACT_KEEP_START -->$/ { keep=1; next }
+      /^<!-- RALPH_COMPACT_KEEP_END -->$/ { exit }
+      keep { print }
+    ' "$progress_file"
+    return
+  fi
+
+  awk '
+    /^## (Live Mission Log|Mission Log|Session History|History|Iteration History)$/ { exit }
+    /^### (Iteration|Session|[0-9][0-9][0-9][0-9]-)/ { exit }
+    { print }
+  ' "$progress_file"
+}
+
+# Default preserved block for progress.md when none exists yet
+write_default_progress_keep_block() {
+  cat << 'EOF'
+# Progress Log
+
+> Updated by the agent after significant work.
+
+- Historical detail is auto-rotated to `.ralph/archive/` during long runs.
+- Keep the live file concise and authoritative.
+EOF
+}
+
+# Rotate progress.md into an archive and keep a compact live summary
+rotate_progress_log() {
+  local workspace="$1"
+  local stamp="$2"
+  local archive_dir archive_file progress_file keep_tmp output_tmp
+
+  progress_file="$workspace/.ralph/progress.md"
+  archive_dir=$(ensure_ralph_archive_dir "$workspace")
+  archive_file="$archive_dir/progress-$stamp.md"
+  keep_tmp=$(mktemp)
+  output_tmp=$(mktemp)
+
+  cp "$progress_file" "$archive_file"
+  extract_progress_keep_block "$progress_file" > "$keep_tmp"
+
+  if [[ ! -s "$keep_tmp" ]]; then
+    write_default_progress_keep_block > "$keep_tmp"
+  fi
+
+  {
+    echo "<!-- RALPH_COMPACT_KEEP_START -->"
+    cat "$keep_tmp"
+    echo "<!-- RALPH_COMPACT_KEEP_END -->"
+    echo ""
+    echo "## Auto Rotation Snapshot"
+    echo ""
+    echo "- Rotated at: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "- Archived full progress log: \`.ralph/archive/$(basename "$archive_file")\`"
+    echo "- Read the preserved block above first on every new iteration."
+    echo "- Only open archived history if the current summary is insufficient to resolve a blocker."
+    echo ""
+  } > "$output_tmp"
+
+  write_task_snapshot_section "$output_tmp" "$workspace" "## Task Snapshot"
+
+  {
+    echo ""
+    echo "## Live Mission Log"
+    echo ""
+    echo "- $(date '+%Y-%m-%d %H:%M:%S %Z'): Progress log auto-rotated. Continue appending new iteration notes below this line."
+  } >> "$output_tmp"
+
+  mv "$output_tmp" "$progress_file"
+  rm -f "$keep_tmp"
+}
+
+# Rotate activity.log into an archive and replace it with a lightweight restart log
+rotate_activity_log() {
+  local workspace="$1"
+  local stamp="$2"
+  local archive_dir archive_file activity_file output_tmp
+
+  activity_file="$workspace/.ralph/activity.log"
+  archive_dir=$(ensure_ralph_archive_dir "$workspace")
+  archive_file="$archive_dir/activity-$stamp.log"
+  output_tmp=$(mktemp)
+
+  cp "$activity_file" "$archive_file"
+
+  {
+    echo "# Activity Log"
+    echo ""
+    echo "> Auto-rotated during a long Ralph run to keep restart context lightweight."
+    echo ""
+    echo "## Rotation"
+    echo ""
+    echo "- Rotated at: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "- Archived raw activity: \`.ralph/archive/$(basename "$archive_file")\`"
+    echo ""
+    echo "## Startup Hints"
+    echo ""
+    echo "- Read \`.ralph/session-brief.md\` first for the current focus, carried-forward notes, and large-file cautions."
+    echo "- Read \`RALPH_TASK.md\`, \`.ralph/guardrails.md\`, and the preserved top block of \`.ralph/progress.md\` first."
+    echo "- Trust the current live summary before reopening rotated archives."
+    echo "- Keep new live activity high-signal; the parser will continue appending below."
+    echo ""
+  } > "$output_tmp"
+
+  write_task_snapshot_section "$output_tmp" "$workspace" "## Task Snapshot"
+
+  {
+    echo ""
+    echo "## Live Append Area"
+    echo ""
+    echo "- $(date '+%Y-%m-%d %H:%M:%S %Z'): Activity log auto-rotated. Continue appending fresh activity below this line."
+  } >> "$output_tmp"
+
+  mv "$output_tmp" "$activity_file"
+}
+
+# Compact long-lived logs between Ralph iterations
+auto_rotate_ralph_logs_if_needed() {
+  local workspace="$1"
+  local progress_file="$workspace/.ralph/progress.md"
+  local activity_file="$workspace/.ralph/activity.log"
+  local stamp=""
+
+  [[ "$AUTO_ROTATE_LOGS" == "true" ]] || return 0
+
+  if should_rotate_log_file "$progress_file" "$PROGRESS_ROTATE_MAX_BYTES" "$PROGRESS_ROTATE_MAX_LINES"; then
+    stamp=$(make_rotation_stamp)
+    echo "🧹 Compacting .ralph/progress.md for the next Ralph iteration..." >&2
+    rotate_progress_log "$workspace" "$stamp"
+  fi
+
+  if should_rotate_log_file "$activity_file" "$ACTIVITY_ROTATE_MAX_BYTES" "$ACTIVITY_ROTATE_MAX_LINES"; then
+    [[ -n "$stamp" ]] || stamp=$(make_rotation_stamp)
+    echo "🧹 Compacting .ralph/activity.log for the next Ralph iteration..." >&2
+    rotate_activity_log "$workspace" "$stamp"
+  fi
+}
+
+# =============================================================================
+# LOCKING AND PROCESS CLEANUP
+# =============================================================================
+
+# Convert ISO-8601 UTC timestamp to epoch seconds (cross-platform)
+iso_utc_to_epoch() {
+  local iso_ts="$1"
+
+  if [[ -z "$iso_ts" ]]; then
+    echo "0"
+    return
+  fi
+
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    date -j -f '%Y-%m-%dT%H:%M:%SZ' "$iso_ts" '+%s' 2>/dev/null || echo "0"
+  else
+    date -d "$iso_ts" '+%s' 2>/dev/null || echo "0"
+  fi
+}
+
+# Release the sequential lock if this shell owns it
+release_sequential_lock() {
+  local lock_dir="${1:-${SEQUENTIAL_LOCK_HELD:-}}"
+  local owner_pid=""
+
+  [[ -n "$lock_dir" ]] || return 0
+  [[ -d "$lock_dir" ]] || return 0
+
+  owner_pid=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
+  if [[ -n "$owner_pid" ]] && [[ "$owner_pid" != "$$" ]]; then
+    return 0
+  fi
+
+  rm -rf "$lock_dir" 2>/dev/null || true
+
+  if [[ "${SEQUENTIAL_LOCK_HELD:-}" == "$lock_dir" ]]; then
+    SEQUENTIAL_LOCK_HELD=""
+  fi
+}
+
+# Acquire a workspace-level lock so sequential Ralph runs do not overlap
+acquire_sequential_lock() {
+  local workspace="${1:-.}"
+  local lock_dir="$workspace/$SEQUENTIAL_LOCK_DIR"
+  local lock_parent
+  lock_parent="$(dirname "$lock_dir")"
+
+  if [[ "${SEQUENTIAL_LOCK_HELD:-}" == "$lock_dir" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$lock_parent"
+
+  if mkdir "$lock_dir" 2>/dev/null; then
+    echo "$$" > "$lock_dir/pid" 2>/dev/null || true
+    date -u '+%Y-%m-%dT%H:%M:%SZ' > "$lock_dir/created_at" 2>/dev/null || true
+    pwd > "$lock_dir/cwd" 2>/dev/null || true
+    SEQUENTIAL_LOCK_HELD="$lock_dir"
+    trap 'release_sequential_lock >/dev/null 2>&1 || true' EXIT INT TERM
+    return 0
+  fi
+
+  local lock_pid lock_created_at now_epoch lock_epoch age_minutes
+  local is_stale=false
+  lock_pid=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
+  lock_created_at=$(cat "$lock_dir/created_at" 2>/dev/null || echo "")
+  now_epoch=$(date '+%s')
+  lock_epoch=$(iso_utc_to_epoch "$lock_created_at")
+  age_minutes=$(( (now_epoch - lock_epoch) / 60 ))
+
+  if [[ -n "$lock_pid" ]]; then
+    if ! kill -0 "$lock_pid" 2>/dev/null; then
+      is_stale=true
+    fi
+  elif [[ "$age_minutes" -ge "$LOCK_STALE_MINUTES" ]]; then
+    is_stale=true
+  fi
+
+  if [[ "$is_stale" == "true" ]]; then
+    echo "🔓 Stale sequential Ralph lock detected (pid: ${lock_pid:-missing}, age ${age_minutes}m). Recovering..." >&2
+    rm -rf "$lock_dir" 2>/dev/null || true
+    if mkdir "$lock_dir" 2>/dev/null; then
+      echo "$$" > "$lock_dir/pid" 2>/dev/null || true
+      date -u '+%Y-%m-%dT%H:%M:%SZ' > "$lock_dir/created_at" 2>/dev/null || true
+      pwd > "$lock_dir/cwd" 2>/dev/null || true
+      SEQUENTIAL_LOCK_HELD="$lock_dir"
+      trap 'release_sequential_lock >/dev/null 2>&1 || true' EXIT INT TERM
+      return 0
+    fi
+  fi
+
+  echo "❌ Ralph loop already running for this workspace: $lock_dir" >&2
+  if [[ -n "$lock_pid" ]]; then
+    echo "   pid: $lock_pid" >&2
+  fi
+  if [[ -n "$lock_created_at" ]]; then
+    echo "   created_at: $lock_created_at" >&2
+  fi
+  echo "   Stop the other Ralph run before starting another one." >&2
+  echo "   If that PID is gone and the lock is stale, delete: rm -rf \"$lock_dir\"" >&2
+  return 1
+}
+
+# List direct child PIDs for a process (cross-platform fallback)
+list_child_pids() {
+  local parent_pid="$1"
+
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -P "$parent_pid" 2>/dev/null || true
+  else
+    ps -o pid= --ppid "$parent_pid" 2>/dev/null | awk '{print $1}' || true
+  fi
+}
+
+# Send a signal to a process tree, deepest children first
+signal_process_tree() {
+  local pid="$1"
+  local signal_name="${2:-TERM}"
+  local child_pid=""
+
+  [[ -n "$pid" ]] || return 0
+
+  for child_pid in $(list_child_pids "$pid"); do
+    signal_process_tree "$child_pid" "$signal_name"
+  done
+
+  kill "-$signal_name" "$pid" 2>/dev/null || true
+}
+
+# Stop a background pipeline and all of its descendants
+stop_process_tree() {
+  local pid="$1"
+
+  [[ -n "$pid" ]] || return 0
+  kill -0 "$pid" 2>/dev/null || return 0
+
+  signal_process_tree "$pid" TERM
+  sleep 1
+
+  if kill -0 "$pid" 2>/dev/null; then
+    signal_process_tree "$pid" KILL
+  fi
+}
+
+# =============================================================================
 # INITIALIZATION
 # =============================================================================
 
@@ -165,9 +884,14 @@ init_ralph_dir() {
   # Initialize progress.md if it doesn't exist
   if [[ ! -f "$ralph_dir/progress.md" ]]; then
     cat > "$ralph_dir/progress.md" << 'EOF'
+<!-- RALPH_COMPACT_KEEP_START -->
 # Progress Log
 
 > Updated by the agent after significant work.
+
+- Keep the live summary concise and authoritative.
+- Historical detail may be auto-rotated to `.ralph/archive/` during long runs.
+<!-- RALPH_COMPACT_KEEP_END -->
 
 ---
 
@@ -223,6 +947,21 @@ EOF
 # Activity Log
 
 > Real-time tool call logging from stream-parser.
+
+EOF
+  fi
+
+  # Initialize session-brief.md if it doesn't exist
+  if [[ ! -f "$ralph_dir/session-brief.md" ]]; then
+    cat > "$ralph_dir/session-brief.md" << 'EOF'
+# Ralph Session Brief
+
+> Auto-generated before each iteration. Read this first.
+
+- Generated: not yet
+- Criteria: 0 / 0 complete
+- Next unchecked criterion: unknown
+- Read strategy: open the relevant slice of `RALPH_TASK.md`, not the whole repo.
 
 EOF
   fi
@@ -381,19 +1120,21 @@ refresh_task_cache() {
 build_prompt() {
   local workspace="$1"
   local iteration="$2"
-  
-  cat << EOF
-# Ralph Iteration $iteration
+
+  cat <<'EOF' | sed "s/__RALPH_ITERATION__/$iteration/g"
+# Ralph Iteration __RALPH_ITERATION__
 
 You are an autonomous development agent using the Ralph methodology.
 
 ## FIRST: Read State Files
 
 Before doing anything:
-1. Read \`RALPH_TASK.md\` - your task and completion criteria
+1. Read \`.ralph/session-brief.md\` - your curated working set for this iteration
 2. Read \`.ralph/guardrails.md\` - lessons from past failures (FOLLOW THESE)
-3. Read \`.ralph/progress.md\` - what's been accomplished
-4. Read \`.ralph/errors.log\` - recent failures to avoid
+3. Do NOT read \`.ralph/progress.md\` unless the brief's carried-forward notes are insufficient
+   - If logs were rotated, trust the live summary first and only read archives if blocked
+4. Prefer the Task Slice already included in the brief; only open \`RALPH_TASK.md\` directly if you need more nearby context
+5. Read \`.ralph/errors.log\` only when the brief points to a recent failure you need more detail on
 
 ## Working Directory (Critical)
 
@@ -421,14 +1162,25 @@ If you get rotated, the next agent picks up from your last commit. Your commits 
 
 ## Task Execution
 
-1. Work on the next unchecked criterion in RALPH_TASK.md (look for \`[ ]\`)
+1. Work on the next unchecked criterion named in \`.ralph/session-brief.md\`
 2. Run tests after changes (check RALPH_TASK.md for test_command)
 3. **Mark completed criteria**: Edit RALPH_TASK.md and change \`[ ]\` to \`[x]\`
    - Example: \`- [ ] Implement parser\` becomes \`- [x] Implement parser\`
    - This is how progress is tracked - YOU MUST update the file
 4. Update \`.ralph/progress.md\` with what you accomplished
+   - Keep it concise and high-signal
+   - Do not paste long command output or rebuild giant historical logs
+   - Preserve the authoritative top summary block when editing
 5. When ALL criteria show \`[x]\`: output \`<ralph>COMPLETE</ralph>\`
 6. If stuck 3+ times on same issue: output \`<ralph>GUTTER</ralph>\`
+
+## Context Discipline (Critical)
+
+- Before full-reading any file larger than roughly 80KB or 800 lines, narrow first with \`rg -n\`, \`git diff --name-only\`, \`wc -l\`, or \`sed -n 'start,endp'\`
+- If a file is listed under "Large Files To Slice First" in the brief, treat full reads as a last resort
+- Do not full-read the same large file more than twice in one session unless you are editing it immediately
+- Avoid chaining together multiple giant file reads before making a concrete code/test change
+- If context is getting tight and you have not written meaningful code yet, stop discovery, update \`.ralph/progress.md\` with the next concrete target, and let rotation happen
 
 ## Learning from Failures
 
@@ -441,7 +1193,7 @@ When something fails:
 ### Sign: [Descriptive Name]
 - **Trigger**: When this situation occurs
 - **Instruction**: What to do instead
-- **Added after**: Iteration $iteration - what happened
+- **Added after**: Iteration __RALPH_ITERATION__ - what happened
 \`\`\`
 
 ## Context Rotation Warning
@@ -450,6 +1202,7 @@ You may receive a warning that context is running low. When you see it:
 1. Finish your current file edit
 2. Commit and push your changes
 3. Update .ralph/progress.md with what you accomplished and what's next
+   - Keep the live summary concise so the next agent can restart cheaply
 4. You will be rotated to a fresh agent that continues your work
 
 Begin by reading the state files.
@@ -477,12 +1230,15 @@ spinner() {
 # =============================================================================
 
 # Run a single agent iteration
-# Returns: signal (ROTATE, GUTTER, COMPLETE, or empty)
+# Returns: signal (ROTATE, GUTTER, COMPLETE, DEFER, or empty)
 run_iteration() {
   local workspace="$1"
   local iteration="$2"
   local session_id="${3:-}"
   local script_dir="${4:-$(dirname "${BASH_SOURCE[0]}")}"
+
+  auto_rotate_ralph_logs_if_needed "$workspace"
+  write_session_brief "$workspace"
   
   local prompt=$(build_prompt "$workspace" "$iteration")
   local fifo="$workspace/.ralph/.parser_fifo"
@@ -506,11 +1262,12 @@ run_iteration() {
   log_progress "$workspace" "**Session $iteration started** (model: $MODEL)"
   
   # Build cursor-agent command
-  local cmd="cursor-agent -p --force --output-format stream-json --model $MODEL"
+  local -a agent_cmd
+  agent_cmd=(cursor-agent -p --force --output-format stream-json --model "$MODEL")
   
   if [[ -n "$session_id" ]]; then
     echo "Resuming session: $session_id" >&2
-    cmd="$cmd --resume=\"$session_id\""
+    agent_cmd+=(--resume "$session_id")
   fi
   
   # Change to workspace
@@ -523,7 +1280,11 @@ run_iteration() {
   # Start parser in background, reading from cursor-agent
   # Parser outputs to fifo, we read signals from fifo
   (
-    eval "$cmd \"$prompt\"" 2>&1 | "$script_dir/stream-parser.sh" "$workspace" > "$fifo"
+    export LARGE_READ_THRESHOLD_BYTES="$LARGE_READ_THRESHOLD_BYTES"
+    export VERY_LARGE_READ_THRESHOLD_BYTES="$VERY_LARGE_READ_THRESHOLD_BYTES"
+    export MAX_LARGE_REREADS_PER_FILE="$MAX_LARGE_REREADS_PER_FILE"
+    export MAX_LARGE_READS_WITHOUT_WRITE="$MAX_LARGE_READS_WITHOUT_WRITE"
+    "${agent_cmd[@]}" "$prompt" 2>&1 | "$script_dir/stream-parser.sh" "$workspace" > "$fifo"
   ) &
   local agent_pid=$!
   
@@ -534,7 +1295,7 @@ run_iteration() {
       "ROTATE")
         printf "\r\033[K" >&2  # Clear spinner line
         echo "🔄 Context rotation triggered - stopping agent..." >&2
-        kill $agent_pid 2>/dev/null || true
+        stop_process_tree "$agent_pid"
         signal="ROTATE"
         break
         ;;
@@ -560,7 +1321,8 @@ run_iteration() {
         echo "⏸️  Rate limit or transient error - deferring for retry..." >&2
         signal="DEFER"
         # Stop the agent, will retry with backoff
-        kill $agent_pid 2>/dev/null || true
+        stop_process_tree "$agent_pid"
+        break
         ;;
     esac
   done < "$fifo"
@@ -589,6 +1351,8 @@ run_iteration() {
 run_ralph_loop() {
   local workspace="$1"
   local script_dir="${2:-$(dirname "${BASH_SOURCE[0]}")}"
+
+  acquire_sequential_lock "$workspace" || return 1
   
   # Commit any uncommitted work first
   cd "$workspace"
@@ -611,11 +1375,41 @@ run_ralph_loop() {
   # Main loop
   local iteration=1
   local session_id=""
+  local thrash_rotation_streak=0
   
   while [[ $iteration -le $MAX_ITERATIONS ]]; do
+    local head_before criteria_before done_before
+    head_before=$(get_git_head)
+    criteria_before=$(count_criteria "$workspace")
+    done_before="${criteria_before%%:*}"
+
     # Run iteration
     local signal
     signal=$(run_iteration "$workspace" "$iteration" "$session_id" "$script_dir")
+
+    local head_after criteria_after done_after
+    head_after=$(get_git_head)
+    criteria_after=$(count_criteria "$workspace")
+    done_after="${criteria_after%%:*}"
+
+    load_last_session_metrics "$workspace"
+
+    local progress_made=0
+    if [[ "$head_before" != "$head_after" ]] || [[ "$done_after" -gt "$done_before" ]] || [[ "${RALPH_SESSION_WORK_WRITE_CALLS:-0}" -gt 0 ]]; then
+      progress_made=1
+    fi
+
+    if [[ "$signal" == "ROTATE" ]] && [[ $progress_made -eq 0 ]] && \
+       ([[ "${RALPH_SESSION_LARGE_READ_THRASH_HIT:-0}" -eq 1 ]] || [[ "${RALPH_SESSION_LARGE_READ_REREADS:-0}" -ge 2 ]]); then
+      thrash_rotation_streak=$((thrash_rotation_streak + 1))
+      log_error "$workspace" "THRASH ROTATION: iteration $iteration rotated without progress (streak $thrash_rotation_streak, large_reads=${RALPH_SESSION_LARGE_READS:-0}, rereads=${RALPH_SESSION_LARGE_READ_REREADS:-0})"
+
+      if [[ $thrash_rotation_streak -ge $MAX_THRASH_ROTATIONS ]]; then
+        signal="THRASH"
+      fi
+    else
+      thrash_rotation_streak=0
+    fi
     
     # Check task completion
     local task_status
@@ -697,6 +1491,15 @@ run_ralph_loop() {
         echo "   1. Check .ralph/guardrails.md for lessons"
         echo "   2. Manually fix the blocking issue"
         echo "   3. Re-run the loop"
+        return 1
+        ;;
+      "THRASH")
+        log_progress "$workspace" "**Session $iteration ended** - 🚨 THRASH STOP (repeated rotate-without-progress)"
+        log_error "$workspace" "🚨 THRASH STOP: Ralph halted after $thrash_rotation_streak rotate-without-progress iterations"
+        echo ""
+        echo "🚨 Ralph detected repeated large-file reread thrash without meaningful progress."
+        echo "   Check .ralph/errors.log for the rotate streak details, tighten the task scope,"
+        echo "   and restart once the next concrete file/test target is clear."
         return 1
         ;;
       "DEFER")

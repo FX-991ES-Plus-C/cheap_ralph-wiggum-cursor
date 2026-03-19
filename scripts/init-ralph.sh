@@ -107,6 +107,7 @@ cat > .ralph/guardrails.md << 'EOF'
 EOF
 
 cat > .ralph/progress.md << 'EOF'
+<!-- RALPH_COMPACT_KEEP_START -->
 # Progress Log
 
 > Updated by the agent after significant work.
@@ -121,6 +122,8 @@ cat > .ralph/progress.md << 'EOF'
 Progress is tracked in THIS FILE, not in LLM context.
 When context is rotated (fresh agent), the new agent reads this file.
 This is how Ralph maintains continuity across iterations.
+Historical detail may be auto-rotated to `.ralph/archive/` during long runs.
+<!-- RALPH_COMPACT_KEEP_END -->
 
 ## Session History
 
@@ -137,6 +140,18 @@ cat > .ralph/activity.log << 'EOF'
 # Activity Log
 
 > Real-time tool call logging from stream-parser.
+
+EOF
+
+cat > .ralph/session-brief.md << 'EOF'
+# Ralph Session Brief
+
+> Auto-generated before each iteration. Read this first.
+
+- Generated: not yet
+- Criteria: 0 / 0 complete
+- Next unchecked criterion: unknown
+- Read strategy: open the relevant slice of `RALPH_TASK.md`, not the whole repo.
 
 EOF
 
@@ -185,6 +200,7 @@ echo "════════════════════════�
 echo ""
 echo "Files created:"
 echo "  • RALPH_TASK.md        - Define your task here"
+echo "  • .ralph/session-brief.md - Auto-generated restart brief (agent reads this first)"
 echo "  • .ralph/guardrails.md - Lessons learned (agent updates this)"
 echo "  • .ralph/progress.md   - Progress log (agent updates this)"
 echo "  • .ralph/activity.log  - Tool call log (parser updates this)"

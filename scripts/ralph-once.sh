@@ -149,6 +149,11 @@ main() {
     echo "Aborted."
     exit 0
   fi
+
+  # Prevent overlapping sequential Ralph runs in the same workspace
+  if ! acquire_sequential_lock "$WORKSPACE"; then
+    exit 1
+  fi
   
   # Commit any uncommitted work first
   cd "$WORKSPACE"

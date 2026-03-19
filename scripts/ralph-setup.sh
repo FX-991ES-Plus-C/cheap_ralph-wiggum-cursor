@@ -344,6 +344,10 @@ main() {
   
   # Handle single iteration first
   if [[ "$run_single_first" == "true" ]]; then
+    if ! acquire_sequential_lock "$workspace"; then
+      exit 1
+    fi
+
     echo ""
     echo "🧪 Running single iteration first..."
     echo ""
