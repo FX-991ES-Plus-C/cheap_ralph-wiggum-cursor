@@ -119,6 +119,15 @@ main() {
   assert_contains "$snapshot_file" "Ralph Dashboard"
   assert_contains "$snapshot_file" "Views:"
   assert_contains "$snapshot_file" "Dashboard shows current task state"
+  assert_contains "$snapshot_file" "Timeline:"
+
+  if python3 - <<'PY' >/dev/null 2>&1
+import textual
+PY
+  then
+    RALPH_TUI_HEADLESS=1 RALPH_TUI_SMOKE_EXIT=1 \
+      python3 "$REPO_DIR/scripts/ralph-tui.py" monitor "$workspace" >/dev/null
+  fi
 
   run_parser_case \
     "complete" \
