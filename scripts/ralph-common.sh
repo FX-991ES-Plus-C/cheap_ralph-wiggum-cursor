@@ -160,6 +160,12 @@ load_last_session_metrics() {
   RALPH_SESSION_LARGE_READS=0
   RALPH_SESSION_LARGE_READ_REREADS=0
   RALPH_SESSION_LARGE_READ_THRASH_HIT=0
+  RALPH_SESSION_PROMPT_TOKENS=0
+  RALPH_SESSION_READ_TOKENS=0
+  RALPH_SESSION_WRITE_TOKENS=0
+  RALPH_SESSION_ASSISTANT_TOKENS=0
+  RALPH_SESSION_SHELL_TOKENS=0
+  RALPH_SESSION_TOOL_OVERHEAD_TOKENS=0
 
   if [[ -f "$summary_file" ]]; then
     # shellcheck disable=SC1090
@@ -1363,6 +1369,7 @@ run_iteration() {
   
   # Read signals from parser
   local signal=""
+  local gutter_seen=0
   while IFS= read -r line; do
     case "$line" in
       "ROTATE")
@@ -1383,8 +1390,8 @@ run_iteration() {
         printf "\r\033[K" >&2  # Clear spinner line
         echo "🚨 Gutter detected - agent may be stuck..." >&2
         write_runtime_state "$workspace" "gutter" "$iteration" "$MODEL" "GUTTER" "Gutter detected" "sequential" "$agent_pid"
-        signal="GUTTER"
-        # Don't kill yet, let agent try to recover
+        gutter_seen=1
+        # Keep reading. A terminal signal like ROTATE/DEFER/COMPLETE may still follow.
         ;;
       "COMPLETE")
         printf "\r\033[K" >&2  # Clear spinner line
@@ -1415,10 +1422,18 @@ run_iteration() {
   
   # Cleanup
   rm -f "$fifo"
+
+  if [[ $gutter_seen -eq 1 ]] && [[ -z "$signal" ]]; then
+    signal="ROTATE"
+  fi
   
   case "$signal" in
     "ROTATE")
-      write_runtime_state "$workspace" "rotating" "$iteration" "$MODEL" "$signal" "Waiting for fresh context" "sequential" ""
+      if [[ $gutter_seen -eq 1 ]]; then
+        write_runtime_state "$workspace" "rotating" "$iteration" "$MODEL" "$signal" "Fresh context requested after gutter" "sequential" ""
+      else
+        write_runtime_state "$workspace" "rotating" "$iteration" "$MODEL" "$signal" "Waiting for fresh context" "sequential" ""
+      fi
       ;;
     "GUTTER")
       write_runtime_state "$workspace" "gutter" "$iteration" "$MODEL" "$signal" "Agent got stuck" "sequential" ""
@@ -1580,24 +1595,29 @@ run_ralph_loop() {
         fi
         ;;
       "ROTATE")
-        log_progress "$workspace" "**Session $iteration ended** - 🔄 Context rotation (token limit reached)"
-        write_runtime_state "$workspace" "rotating" "$iteration" "$MODEL" "ROTATE" "Rotating to fresh context" "loop" ""
-        echo ""
-        echo "🔄 Rotating to fresh context..."
+        if [[ "${RALPH_SESSION_SIGNAL:-NONE}" == "GUTTER" ]]; then
+          log_progress "$workspace" "**Session $iteration ended** - 🔄 Fresh context after GUTTER"
+          write_runtime_state "$workspace" "rotating" "$iteration" "$MODEL" "ROTATE" "Rotating after gutter" "loop" ""
+          echo ""
+          echo "🔄 Gutter detected. Rotating to fresh context..."
+        else
+          log_progress "$workspace" "**Session $iteration ended** - 🔄 Context rotation (token limit reached)"
+          write_runtime_state "$workspace" "rotating" "$iteration" "$MODEL" "ROTATE" "Rotating to fresh context" "loop" ""
+          echo ""
+          echo "🔄 Rotating to fresh context..."
+        fi
         iteration=$((iteration + 1))
         session_id=""
         ;;
       "GUTTER")
-        log_progress "$workspace" "**Session $iteration ended** - 🚨 GUTTER (agent stuck)"
-        append_signal_event "$workspace" "GUTTER" "Loop stopped because the agent got stuck" "loop" "$iteration"
-        write_runtime_state "$workspace" "gutter" "$iteration" "$MODEL" "GUTTER" "Loop stopped because the agent got stuck" "loop" ""
+        log_progress "$workspace" "**Session $iteration ended** - 🔄 Fresh context after GUTTER"
+        append_signal_event "$workspace" "GUTTER" "Loop rotating after gutter detection" "loop" "$iteration"
+        write_runtime_state "$workspace" "rotating" "$iteration" "$MODEL" "GUTTER" "Loop rotating after gutter detection" "loop" ""
         echo ""
-        echo "🚨 Gutter detected. Check .ralph/errors.log for details."
-        echo "   The agent may be stuck. Consider:"
-        echo "   1. Check .ralph/guardrails.md for lessons"
-        echo "   2. Manually fix the blocking issue"
-        echo "   3. Re-run the loop"
-        return 1
+        echo "🔄 Gutter detected. Rotating to fresh context..."
+        echo "   Check .ralph/errors.log and .ralph/guardrails.md if the same issue repeats."
+        iteration=$((iteration + 1))
+        session_id=""
         ;;
       "THRASH")
         log_progress "$workspace" "**Session $iteration ended** - 🚨 THRASH STOP (repeated rotate-without-progress)"

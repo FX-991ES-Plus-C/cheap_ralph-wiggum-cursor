@@ -55,6 +55,11 @@ COMPLETE_SENT=0
 DEFER_SENT=0
 LAST_SIGNAL="NONE"
 LARGE_READ_THRASH_HIT=0
+TOKEN_EST_PROMPT=0
+TOKEN_EST_READ=0
+TOKEN_EST_WRITE=0
+TOKEN_EST_ASSISTANT=0
+TOKEN_EST_SHELL=0
 
 # Estimate initial prompt size (Ralph prompt is ~2KB + file references)
 PROMPT_CHARS=3000
@@ -80,9 +85,127 @@ get_health_emoji() {
 }
 
 calc_tokens() {
-  local total_bytes=$((PROMPT_CHARS + BYTES_READ + BYTES_WRITTEN + ASSISTANT_CHARS + SHELL_OUTPUT_CHARS))
-  echo $((total_bytes / 4))
+  echo $((TOKEN_EST_PROMPT + TOKEN_EST_READ + TOKEN_EST_WRITE + TOKEN_EST_ASSISTANT + TOKEN_EST_SHELL + (TOOL_CALLS * 12)))
 }
+
+estimate_tokens_by_ratio10() {
+  local chars=$1
+  local ratio10=${2:-40}
+
+  if [[ $chars -le 0 ]]; then
+    echo 0
+    return
+  fi
+
+  echo $(((chars * 10 + ratio10 - 1) / ratio10))
+}
+
+estimate_density_ratio10() {
+  local bytes=$1
+  local lines=$2
+
+  if [[ $bytes -le 0 ]]; then
+    echo 34
+    return
+  fi
+
+  if [[ $lines -le 0 ]]; then
+    echo 34
+    return
+  fi
+
+  local avg=$((bytes / lines))
+  if [[ $avg -le 24 ]]; then
+    echo 28
+  elif [[ $avg -le 48 ]]; then
+    echo 30
+  elif [[ $avg -le 96 ]]; then
+    echo 34
+  elif [[ $avg -le 160 ]]; then
+    echo 38
+  else
+    echo 42
+  fi
+}
+
+estimate_prompt_tokens() {
+  local chars=$1
+  local payload
+  payload=$(estimate_tokens_by_ratio10 "$chars" 34)
+  echo $((payload + 120))
+}
+
+estimate_read_tokens() {
+  local bytes=$1
+  local lines=$2
+
+  if [[ $bytes -le 0 ]]; then
+    bytes=$((lines * 90))
+  fi
+
+  local ratio10
+  ratio10=$(estimate_density_ratio10 "$bytes" "$lines")
+  local payload
+  payload=$(estimate_tokens_by_ratio10 "$bytes" "$ratio10")
+  local structural=$((lines / 40 + 14))
+  echo $((payload + structural))
+}
+
+estimate_write_tokens() {
+  local bytes=$1
+  local lines=$2
+
+  if [[ $bytes -le 0 ]]; then
+    bytes=$((lines * 90))
+  fi
+
+  local ratio10
+  ratio10=$(estimate_density_ratio10 "$bytes" "$lines")
+  if [[ $ratio10 -gt 30 ]]; then
+    ratio10=$((ratio10 - 2))
+  fi
+  local payload
+  payload=$(estimate_tokens_by_ratio10 "$bytes" "$ratio10")
+  local structural=$((lines / 30 + 18))
+  echo $((payload + structural))
+}
+
+estimate_assistant_tokens() {
+  local chars=$1
+  local text="$2"
+  local ratio10=36
+
+  if [[ "$text" == *'```'* ]]; then
+    ratio10=30
+  elif [[ "$text" == *$'\n'* ]]; then
+    ratio10=34
+  fi
+
+  local payload
+  payload=$(estimate_tokens_by_ratio10 "$chars" "$ratio10")
+  echo $((payload + 12))
+}
+
+estimate_shell_tokens() {
+  local chars=$1
+  local lines=$2
+
+  if [[ $chars -le 0 ]]; then
+    echo 0
+    return
+  fi
+
+  local ratio10=42
+  if [[ $lines -ge 20 ]]; then
+    ratio10=38
+  fi
+
+  local payload
+  payload=$(estimate_tokens_by_ratio10 "$chars" "$ratio10")
+  echo $((payload + lines / 25 + 8))
+}
+
+TOKEN_EST_PROMPT=$(estimate_prompt_tokens "$PROMPT_CHARS")
 
 log_signal_event() {
   local signal="$1"
@@ -104,6 +227,8 @@ emit_signal_once() {
   local activity_message="${2:-}"
   local error_message="${3:-}"
 
+  # ROTATE / COMPLETE / DEFER are terminal for the current parser session.
+  # GUTTER is sticky, but non-terminal, so a later ROTATE can still happen.
   if [[ $TERMINAL_SIGNAL_SENT -eq 1 ]] && [[ "$LAST_SIGNAL" != "$signal" ]]; then
     return
   fi
@@ -117,7 +242,6 @@ emit_signal_once() {
     "GUTTER")
       [[ $GUTTER_SENT -eq 1 ]] && return
       GUTTER_SENT=1
-      TERMINAL_SIGNAL_SENT=1
       ;;
     "COMPLETE")
       [[ $COMPLETE_SENT -eq 1 ]] && return
@@ -353,6 +477,12 @@ RALPH_SESSION_SHELL_CALLS=$SHELL_CALLS
 RALPH_SESSION_LARGE_READS=$LARGE_READS
 RALPH_SESSION_LARGE_READ_REREADS=$LARGE_READ_REREADS
 RALPH_SESSION_LARGE_READ_THRASH_HIT=$LARGE_READ_THRASH_HIT
+RALPH_SESSION_PROMPT_TOKENS=$TOKEN_EST_PROMPT
+RALPH_SESSION_READ_TOKENS=$TOKEN_EST_READ
+RALPH_SESSION_WRITE_TOKENS=$TOKEN_EST_WRITE
+RALPH_SESSION_ASSISTANT_TOKENS=$TOKEN_EST_ASSISTANT
+RALPH_SESSION_SHELL_TOKENS=$TOKEN_EST_SHELL
+RALPH_SESSION_TOOL_OVERHEAD_TOKENS=$((TOOL_CALLS * 12))
 EOF
 }
 
@@ -398,6 +528,9 @@ process_line() {
       if [[ -n "$text" ]]; then
         local chars=${#text}
         ASSISTANT_CHARS=$((ASSISTANT_CHARS + chars))
+        local assistant_tokens
+        assistant_tokens=$(estimate_assistant_tokens "$chars" "$text")
+        TOKEN_EST_ASSISTANT=$((TOKEN_EST_ASSISTANT + assistant_tokens))
         
         # Check for completion sigil
         if [[ "$text" == *"<ralph>COMPLETE</ralph>"* ]]; then
@@ -429,9 +562,12 @@ process_line() {
             bytes=$((lines * 100))  # ~100 chars/line for code
           fi
           BYTES_READ=$((BYTES_READ + bytes))
+          local read_tokens
+          read_tokens=$(estimate_read_tokens "$bytes" "$lines")
+          TOKEN_EST_READ=$((TOKEN_EST_READ + read_tokens))
           
           local kb=$(echo "scale=1; $bytes / 1024" | bc 2>/dev/null || echo "$((bytes / 1024))")
-          log_activity "READ $path ($lines lines, ~${kb}KB)"
+          log_activity "READ $path ($lines lines, ~${kb}KB, ~${read_tokens} tok)"
           track_file_read "$path" "$bytes" "$lines"
           
         # Handle write tool completion
@@ -441,12 +577,15 @@ process_line() {
           local bytes=$(echo "$line" | jq -r '.tool_call.writeToolCall.result.success.fileSize // 0' 2>/dev/null) || bytes=0
           BYTES_WRITTEN=$((BYTES_WRITTEN + bytes))
           WRITE_CALLS=$((WRITE_CALLS + 1))
+          local write_tokens
+          write_tokens=$(estimate_write_tokens "$bytes" "$lines")
+          TOKEN_EST_WRITE=$((TOKEN_EST_WRITE + write_tokens))
           if [[ "$path" != "$RALPH_DIR/"* ]] && [[ "$path" != ".ralph/"* ]]; then
             WORK_WRITE_CALLS=$((WORK_WRITE_CALLS + 1))
           fi
           
           local kb=$(echo "scale=1; $bytes / 1024" | bc 2>/dev/null || echo "$((bytes / 1024))")
-          log_activity "WRITE $path ($lines lines, ${kb}KB)"
+          log_activity "WRITE $path ($lines lines, ${kb}KB, ~${write_tokens} tok)"
           
           # Track for thrashing detection
           track_file_write "$path"
@@ -461,15 +600,22 @@ process_line() {
           local stderr=$(echo "$line" | jq -r '.tool_call.shellToolCall.result.stderr // ""' 2>/dev/null) || stderr=""
           local output_chars=$((${#stdout} + ${#stderr}))
           SHELL_OUTPUT_CHARS=$((SHELL_OUTPUT_CHARS + output_chars))
+          local output_lines=0
+          if [[ -n "$stdout$stderr" ]]; then
+            output_lines=$(printf '%s' "$stdout$stderr" | awk 'END { print NR+0 }')
+          fi
+          local shell_tokens
+          shell_tokens=$(estimate_shell_tokens "$output_chars" "$output_lines")
+          TOKEN_EST_SHELL=$((TOKEN_EST_SHELL + shell_tokens))
           
           if [[ $exit_code -eq 0 ]]; then
             if [[ $output_chars -gt 1024 ]]; then
-              log_activity "SHELL $cmd → exit 0 (${output_chars} chars output)"
+              log_activity "SHELL $cmd → exit 0 (${output_chars} chars, ~${shell_tokens} tok)"
             else
-              log_activity "SHELL $cmd → exit 0"
+              log_activity "SHELL $cmd → exit 0 (~${shell_tokens} tok)"
             fi
           else
-            log_activity "SHELL $cmd → exit $exit_code"
+            log_activity "SHELL $cmd → exit $exit_code (~${shell_tokens} tok)"
             track_shell_failure "$cmd" "$exit_code"
           fi
         fi

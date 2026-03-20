@@ -153,6 +153,23 @@ PY
 
   assert_contains "$rotate_workspace/parser.out" "ROTATE"
   assert_contains "$rotate_workspace/.ralph/signals.log" "signal=ROTATE"
+  assert_contains "$rotate_workspace/.ralph/.last-session.env" "RALPH_SESSION_READ_TOKENS="
+  assert_contains "$rotate_workspace/.ralph/.last-session.env" "RALPH_SESSION_TOOL_OVERHEAD_TOKENS="
+
+  local gutter_rotate_workspace
+  gutter_rotate_workspace="$(make_workspace)"
+  printf '%s\n' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"shellToolCall":{"args":{"command":"pnpm test"},"result":{"exitCode":1,"stdout":"","stderr":"fail"}}}}' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"shellToolCall":{"args":{"command":"pnpm test"},"result":{"exitCode":1,"stdout":"","stderr":"fail"}}}}' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"shellToolCall":{"args":{"command":"pnpm test"},"result":{"exitCode":1,"stdout":"","stderr":"fail"}}}}' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/heavy.ts"},"result":{"success":{"totalLines":120,"contentSize":2600}}}}}' \
+    | WARN_THRESHOLD=1100 ROTATE_THRESHOLD=1400 bash "$REPO_DIR/scripts/stream-parser.sh" "$gutter_rotate_workspace" >"$gutter_rotate_workspace/parser.out"
+
+  assert_contains "$gutter_rotate_workspace/parser.out" "GUTTER"
+  assert_contains "$gutter_rotate_workspace/parser.out" "ROTATE"
+  assert_contains "$gutter_rotate_workspace/.ralph/signals.log" "signal=GUTTER"
+  assert_contains "$gutter_rotate_workspace/.ralph/signals.log" "signal=ROTATE"
+  assert_contains "$gutter_rotate_workspace/.ralph/.last-session.env" "RALPH_SESSION_SIGNAL=ROTATE"
 
   echo "dashboard smoke test passed"
 }

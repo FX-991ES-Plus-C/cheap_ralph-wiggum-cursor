@@ -71,7 +71,7 @@ This creates two problems:
 - **Interactive setup** - Beautiful gum-based UI for model selection and options
 - **FUN live dashboard** - Lightweight fullscreen TUI for activity, progress, tasks, errors, and signal history
 - **Cheap-model handoff** - Auto-generates `.ralph/session-brief.md` so each new iteration starts from a curated working set instead of rediscovering context
-- **Accurate token tracking** - Parser counts actual bytes from every file read/write
+- **Smarter token tracking** - Parser weights reads, writes, assistant output, shell output, and tool-call overhead instead of using a flat chars/4 guess
 - **Anti-thrash detection** - Detects when the agent is stuck on repeated failures, write-thrashing, or repeated large-file rereads
 - **Self-managing continuity** - Compacts live progress/activity logs and archives history so long runs stay restartable
 - **Rate limit handling** - Detects rate limits/network errors, waits with exponential backoff
@@ -572,16 +572,16 @@ The parser detects when the agent is stuck:
 
 | Pattern | Trigger | What Happens |
 |---------|---------|--------------|
-| Repeated failure | Same command failed 3x | GUTTER signal |
-| File thrashing | Same file written 5x in 10 min | GUTTER signal |
-| Large-file reread thrash | Same large file reread before any write | GUTTER signal |
+| Repeated failure | Same command failed 3x | GUTTER signal, then fresh-context rotation |
+| File thrashing | Same file written 5x in 10 min | GUTTER signal, then fresh-context rotation |
+| Large-file reread thrash | Same large file reread before any write | GUTTER signal, then fresh-context rotation |
 | Rotate-without-progress streak | Repeated rotate sessions with no useful work | THRASH STOP |
-| Agent signals | Agent outputs `<ralph>GUTTER</ralph>` | GUTTER signal |
+| Agent signals | Agent outputs `<ralph>GUTTER</ralph>` | GUTTER signal, then fresh-context rotation |
 
 When gutter is detected:
-1. Check `.ralph/errors.log` for the pattern
-2. Fix the issue manually or add a guardrail
-3. Re-run the loop
+1. Ralph records the gutter event and rotates to a fresh context
+2. Check `.ralph/errors.log` for the pattern if it repeats
+3. Add a guardrail or tighten the task if the same issue keeps coming back
 
 When a `THRASH STOP` occurs:
 1. Check `.ralph/activity.log` and `.ralph/errors.log` for the repeated reread pattern
