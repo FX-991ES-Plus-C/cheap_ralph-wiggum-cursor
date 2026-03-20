@@ -378,7 +378,7 @@ main() {
     
     # Run just one iteration
     local signal
-    signal=$(run_iteration "$workspace" "1" "" "$SCRIPT_DIR")
+    signal=$(run_iteration "$workspace" "1" "$SCRIPT_DIR")
     
     # Check result
     local task_status
@@ -401,10 +401,8 @@ main() {
     
     # Continue with remaining iterations (start from 2)
     local iteration=2
-    local session_id=""
-    
     while [[ $iteration -le $MAX_ITERATIONS ]]; do
-      signal=$(run_iteration "$workspace" "$iteration" "$session_id" "$SCRIPT_DIR")
+      signal=$(run_iteration "$workspace" "$iteration" "$SCRIPT_DIR")
       task_status=$(check_task_complete "$workspace")
       
       if [[ "$task_status" == "COMPLETE" ]]; then
@@ -435,7 +433,6 @@ main() {
           log_progress "$workspace" "**Session $iteration ended** - 🔄 Context rotation"
           echo "🔄 Rotating to fresh context..."
           iteration=$((iteration + 1))
-          session_id=""
           ;;
         "GUTTER")
           log_progress "$workspace" "**Session $iteration ended** - 🚨 GUTTER"

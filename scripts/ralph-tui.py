@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import inspect
 import os
+import re
 import shlex
 import signal
 import sys
@@ -44,14 +45,35 @@ TAB_LABELS = {
     "errors": "5 Errors",
     "console": "6 Console",
 }
-SIGNAL_MARKERS = ("WARN", "ROTATE", "GUTTER", "COMPLETE", "DEFER")
+SIGNAL_LINE_PATTERN = re.compile(r"\bsignal=([A-Za-z0-9_:-]+)")
+RALPH_TAG_PATTERN = re.compile(r"<ralph>\s*([A-Za-z0-9_:-]+)\s*</ralph>", re.IGNORECASE)
+KNOWN_SIGNAL_MARKERS = (
+    "MAX_ITERATIONS",
+    "SESSION_START",
+    "LOOP_COMPLETE",
+    "LOOP_START",
+    "COMPLETE",
+    "ROTATE",
+    "GUTTER",
+    "THRASH",
+    "DEFER",
+    "ABORT",
+    "WARN",
+)
 SIGNAL_STYLES = {
     "WARN": "bold #ffd166",
     "ROTATE": "bold #f4a261",
     "GUTTER": "bold #90e0ef",
     "COMPLETE": "bold #2a9d8f",
     "DEFER": "bold #e76f51",
+    "ABORT": "bold #e76f51",
+    "THRASH": "bold #e76f51",
+    "MAX_ITERATIONS": "bold #e76f51",
+    "SESSION_START": "bold #8ecae6",
+    "LOOP_START": "bold #8ecae6",
+    "LOOP_COMPLETE": "bold #2a9d8f",
 }
+DEFAULT_SIGNAL_STYLE = "bold #8ecae6"
 EMPTY_STATE_HINTS = {
     "activity": "Ralph writes token summaries and loop events here.",
     "progress": "Compacted notes and session history land here.",
@@ -217,6 +239,51 @@ def latest_token_summary(activity_file: Path, session: dict[str, str]) -> tuple[
     return token_count, token_pct
 
 
+def current_session_metadata(state: DashboardState) -> dict[str, str]:
+    runtime_iteration = state.runtime.get("RALPH_RUNTIME_ITERATION", "").strip()
+    session_iteration = state.session.get("RALPH_SESSION_ITERATION", "").strip()
+    if session_iteration and runtime_iteration and session_iteration != runtime_iteration:
+        return {}
+    return state.session
+
+
+def shorten_identifier(raw: str, width: int = 12) -> str:
+    cleaned = raw.strip()
+    if len(cleaned) <= width:
+        return cleaned
+    return cleaned[:width]
+
+
+def cursor_session_summary(state: DashboardState) -> str:
+    session = current_session_metadata(state)
+    session_id = session.get("RALPH_SESSION_ID", "").strip()
+    request_id = session.get("RALPH_SESSION_REQUEST_ID", "").strip()
+    permission_mode = session.get("RALPH_SESSION_PERMISSION_MODE", "").strip()
+
+    parts: list[str] = []
+    if session_id:
+        parts.append(f"session {session_id}")
+    elif state.runtime.get("RALPH_RUNTIME_STATUS", "").lower() in {
+        "running",
+        "starting",
+        "rotating",
+        "gutter",
+        "deferred",
+        "complete",
+        "thrash",
+        "error",
+    }:
+        parts.append("session pending")
+    else:
+        parts.append("session unavailable")
+
+    if request_id:
+        parts.append(f"req {shorten_identifier(request_id)}")
+    if permission_mode:
+        parts.append(f"perm {permission_mode}")
+    return " | ".join(parts)
+
+
 def health_label(token_pct: int) -> str:
     if token_pct >= 90:
         return "SPICY"
@@ -308,12 +375,12 @@ def parse_runtime_timestamp(raw: str) -> datetime | None:
 
 def signal_from_line(line: str) -> str | None:
     upper_line = line.upper()
-    for marker in SIGNAL_MARKERS:
-        if f"SIGNAL={marker}" in upper_line:
-            return marker
-        if f"<RALPH>{marker}</RALPH>" in upper_line:
-            return marker
-        if marker in upper_line and any(token in upper_line for token in ("signal", "<ralph>", "dashboard")):
+    if match := SIGNAL_LINE_PATTERN.search(line):
+        return match.group(1).upper()
+    if match := RALPH_TAG_PATTERN.search(line):
+        return match.group(1).upper()
+    for marker in KNOWN_SIGNAL_MARKERS:
+        if marker in upper_line and any(token in upper_line for token in ("SIGNAL", "<RALPH>", "DASHBOARD")):
             return marker
     return None
 
@@ -346,6 +413,15 @@ def signalish_line(line: str) -> bool:
     return signal_from_line(line) is not None or "signal=" in line.lower() or "<ralph>" in line.lower()
 
 
+def signal_notification_severity(signal_name: str) -> str:
+    upper_name = signal_name.upper()
+    if upper_name in {"ABORT", "THRASH", "MAX_ITERATIONS"}:
+        return "error"
+    if upper_name in {"WARN", "DEFER", "GUTTER", "ROTATE"}:
+        return "warning"
+    return "information"
+
+
 def interesting_line(line: str) -> bool:
     lowered = line.lower()
     return (
@@ -366,6 +442,12 @@ def mood_snapshot(state: DashboardState) -> tuple[str, str, str]:
         return "\\o/", "mission accomplished", "#2a9d8f"
     if state.is_stale:
         return "-_-", "waiting for fresh log crumbs", "#e76f51"
+    if last_signal == "ABORT":
+        return "x_x", "hit a hard stop and needs help", "#e76f51"
+    if last_signal == "THRASH":
+        return "@_@", "spinning without enough progress", "#e76f51"
+    if last_signal == "MAX_ITERATIONS":
+        return ":/", "out of planned passes", "#e76f51"
     if last_signal == "WARN":
         return "<!>", "heads-up, context is getting warm", "#ffd166"
     if last_signal == "ROTATE":
@@ -550,6 +632,7 @@ def render_snapshot(state: DashboardState) -> str:
             f"Mode: {state.runtime['RALPH_RUNTIME_MODE']}  "
             f"Model: {state.runtime['RALPH_RUNTIME_MODEL']}"
         ),
+        f"Cursor: {cursor_session_summary(state)}",
         (
             "Signal: "
             f"{state.runtime['RALPH_RUNTIME_LAST_SIGNAL']}  "
@@ -910,7 +993,7 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
 
             signal_name = signal_from_line(line)
             if signal_name:
-                return SIGNAL_STYLES[signal_name]
+                return SIGNAL_STYLES.get(signal_name, DEFAULT_SIGNAL_STYLE)
             if self.view_name == "tasks":
                 if stripped.startswith("#"):
                     return "bold #8ecae6"
@@ -1616,6 +1699,11 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                     f"Iteration: {state.runtime['RALPH_RUNTIME_ITERATION']}",
                     style="#bde0fe",
                 ),
+                Text(
+                    "Cursor: " + cursor_session_summary(state),
+                    style="#f7f4ea",
+                    overflow="ellipsis",
+                ),
                 Text(f"Freshness: {freshness}  |  Layout: {layout}", style="#f7f4ea"),
                 Text(
                     "Event: "
@@ -1752,13 +1840,10 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             if allow_toasts and current_signal and current_signal != previous_signal:
                 signal_name = signal_from_line(current_signal)
                 if signal_name:
-                    severity = "information"
-                    if signal_name in {"WARN", "DEFER"}:
-                        severity = "warning"
                     self.notify(
                         current_signal[-160:],
                         title=f"Ralph {signal_name}",
-                        severity=severity,
+                        severity=signal_notification_severity(signal_name),
                         timeout=4,
                     )
 

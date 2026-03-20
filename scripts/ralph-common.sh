@@ -146,6 +146,11 @@ load_last_session_metrics() {
   local workspace="${1:-.}"
   local summary_file="$workspace/.ralph/.last-session.env"
 
+  RALPH_SESSION_ITERATION=0
+  RALPH_SESSION_ID=""
+  RALPH_SESSION_REQUEST_ID=""
+  RALPH_SESSION_PERMISSION_MODE=""
+  RALPH_SESSION_MODEL=""
   RALPH_SESSION_SIGNAL="NONE"
   RALPH_SESSION_TOKENS=0
   RALPH_SESSION_BYTES_READ=0
@@ -171,6 +176,47 @@ load_last_session_metrics() {
     # shellcheck disable=SC1090
     source "$summary_file"
   fi
+}
+
+initialize_session_metrics() {
+  local workspace="${1:-.}"
+  local iteration="${2:-0}"
+  local model="${3:-$MODEL}"
+  local summary_file="$workspace/.ralph/.last-session.env"
+  local tmp_file
+
+  mkdir -p "$workspace/.ralph"
+  tmp_file=$(mktemp)
+
+  {
+    printf 'RALPH_SESSION_ITERATION=%q\n' "$iteration"
+    printf 'RALPH_SESSION_ID=%q\n' ""
+    printf 'RALPH_SESSION_REQUEST_ID=%q\n' ""
+    printf 'RALPH_SESSION_PERMISSION_MODE=%q\n' ""
+    printf 'RALPH_SESSION_MODEL=%q\n' "$model"
+    printf 'RALPH_SESSION_SIGNAL=%q\n' "NONE"
+    printf 'RALPH_SESSION_TOKENS=%q\n' "0"
+    printf 'RALPH_SESSION_BYTES_READ=%q\n' "0"
+    printf 'RALPH_SESSION_BYTES_WRITTEN=%q\n' "0"
+    printf 'RALPH_SESSION_ASSISTANT_CHARS=%q\n' "0"
+    printf 'RALPH_SESSION_SHELL_OUTPUT_CHARS=%q\n' "0"
+    printf 'RALPH_SESSION_TOOL_CALLS=%q\n' "0"
+    printf 'RALPH_SESSION_READ_CALLS=%q\n' "0"
+    printf 'RALPH_SESSION_WRITE_CALLS=%q\n' "0"
+    printf 'RALPH_SESSION_WORK_WRITE_CALLS=%q\n' "0"
+    printf 'RALPH_SESSION_SHELL_CALLS=%q\n' "0"
+    printf 'RALPH_SESSION_LARGE_READS=%q\n' "0"
+    printf 'RALPH_SESSION_LARGE_READ_REREADS=%q\n' "0"
+    printf 'RALPH_SESSION_LARGE_READ_THRASH_HIT=%q\n' "0"
+    printf 'RALPH_SESSION_PROMPT_TOKENS=%q\n' "0"
+    printf 'RALPH_SESSION_READ_TOKENS=%q\n' "0"
+    printf 'RALPH_SESSION_WRITE_TOKENS=%q\n' "0"
+    printf 'RALPH_SESSION_ASSISTANT_TOKENS=%q\n' "0"
+    printf 'RALPH_SESSION_SHELL_TOKENS=%q\n' "0"
+    printf 'RALPH_SESSION_TOOL_OVERHEAD_TOKENS=%q\n' "0"
+  } > "$tmp_file"
+
+  mv "$tmp_file" "$summary_file"
 }
 
 # =============================================================================
@@ -348,6 +394,16 @@ list_task_descriptions() {
     | sed -E 's/[[:space:]]*<!--[[:space:]]*group:[[:space:]]*[0-9]+[[:space:]]*-->[[:space:]]*$//'
 }
 
+# Return a bounded sample without tripping pipefail via head(1)
+sample_task_descriptions() {
+  local workspace="$1"
+  local status="$2"
+  local limit="${3:-5}"
+
+  [[ "$limit" =~ ^[0-9]+$ ]] || limit=5
+  list_task_descriptions "$workspace" "$status" 2>/dev/null | sed -n "1,${limit}p"
+}
+
 # Write a compact task snapshot to a file
 write_task_snapshot_section() {
   local output_file="$1"
@@ -367,8 +423,8 @@ write_task_snapshot_section() {
     remaining_count=0
   fi
 
-  completed_sample=$(list_task_descriptions "$workspace" completed | tail -n 6)
-  pending_sample=$(list_task_descriptions "$workspace" pending | head -n 6)
+  completed_sample=$(list_task_descriptions "$workspace" completed 2>/dev/null | tail -n 6)
+  pending_sample=$(sample_task_descriptions "$workspace" pending 6)
 
   {
     echo "$heading"
@@ -526,9 +582,9 @@ write_session_brief() {
     fi
   fi
 
-  pending_sample=$(list_task_descriptions "$workspace" pending | head -n 5)
-  completed_sample=$(list_task_descriptions "$workspace" completed | tail -n 4)
-  dirty_files=$(git -C "$workspace" status --short --untracked-files=all 2>/dev/null | head -n "$SESSION_BRIEF_MAX_DIRTY_FILES")
+  pending_sample=$(sample_task_descriptions "$workspace" pending 5)
+  completed_sample=$(list_task_descriptions "$workspace" completed 2>/dev/null | tail -n 4)
+  dirty_files=$(git -C "$workspace" status --short --untracked-files=all 2>/dev/null | sed -n "1,${SESSION_BRIEF_MAX_DIRTY_FILES}p")
   recent_errors=$(grep -vE '^(#|>|$)' "$workspace/.ralph/errors.log" 2>/dev/null | tail -n "$SESSION_BRIEF_MAX_ERROR_LINES")
   large_files=$(list_large_context_files "$workspace")
 
@@ -536,7 +592,7 @@ write_session_brief() {
     carried_notes=$(extract_progress_keep_block "$workspace/.ralph/progress.md" \
       | grep -E '^[[:space:]]*-' \
       | sed -E 's/^[[:space:]]*-[[:space:]]+//' \
-      | head -n 8)
+      | sed -n '1,8p')
   else
     carried_notes=""
   fi
@@ -1141,7 +1197,7 @@ get_next_task_info() {
   local workspace="${1:-.}"
   
   if [[ "${_TASK_PARSER_AVAILABLE:-0}" -eq 1 ]]; then
-    get_next_task "$workspace"
+    get_next_task "$workspace" 2>/dev/null || true
   else
     echo ""
   fi
@@ -1307,11 +1363,11 @@ spinner() {
 run_iteration() {
   local workspace="$1"
   local iteration="$2"
-  local session_id="${3:-}"
-  local script_dir="${4:-$(dirname "${BASH_SOURCE[0]}")}"
+  local script_dir="${3:-$(dirname "${BASH_SOURCE[0]}")}"
 
   auto_rotate_ralph_logs_if_needed "$workspace"
   write_session_brief "$workspace"
+  initialize_session_metrics "$workspace" "$iteration" "$MODEL"
   
   local prompt=$(build_prompt "$workspace" "$iteration")
   local fifo="$workspace/.ralph/.parser_fifo"
@@ -1339,13 +1395,11 @@ run_iteration() {
   
   # Build cursor-agent command
   local -a agent_cmd
-  agent_cmd=(cursor-agent -p --force --output-format stream-json --model "$MODEL")
-  
-  if [[ -n "$session_id" ]]; then
-    echo "Resuming session: $session_id" >&2
-    agent_cmd+=(--resume "$session_id")
+  agent_cmd=(cursor-agent -p --force --output-format stream-json)
+  if [[ -n "${MODEL:-}" ]] && [[ "$MODEL" != "auto" ]]; then
+    agent_cmd+=(--model "$MODEL")
   fi
-  
+
   # Change to workspace
   cd "$workspace"
   
@@ -1413,7 +1467,8 @@ run_iteration() {
   done < "$fifo"
   
   # Wait for agent to finish
-  wait $agent_pid 2>/dev/null || true
+  local agent_exit=0
+  wait $agent_pid 2>/dev/null || agent_exit=$?
   
   # Stop spinner and clear line
   kill $spinner_pid 2>/dev/null || true
@@ -1422,6 +1477,12 @@ run_iteration() {
   
   # Cleanup
   rm -f "$fifo"
+
+  if [[ -z "$signal" ]] && [[ $agent_exit -ne 0 ]]; then
+    signal="ABORT"
+    log_error "$workspace" "Agent process exited with code $agent_exit before producing a Ralph signal"
+    write_runtime_state "$workspace" "error" "$iteration" "$MODEL" "ABORT" "Agent exited with code $agent_exit" "sequential" ""
+  fi
 
   if [[ $gutter_seen -eq 1 ]] && [[ -z "$signal" ]]; then
     signal="ROTATE"
@@ -1443,6 +1504,9 @@ run_iteration() {
       ;;
     "DEFER")
       write_runtime_state "$workspace" "deferred" "$iteration" "$MODEL" "$signal" "Retrying after transient issue" "sequential" ""
+      ;;
+    "ABORT")
+      write_runtime_state "$workspace" "error" "$iteration" "$MODEL" "$signal" "Agent launch/runtime failure" "sequential" ""
       ;;
     *)
       write_runtime_state "$workspace" "idle" "$iteration" "$MODEL" "NONE" "Session $iteration finished" "sequential" ""
@@ -1487,7 +1551,6 @@ run_ralph_loop() {
   
   # Main loop
   local iteration=1
-  local session_id=""
   local thrash_rotation_streak=0
   
   while [[ $iteration -le $MAX_ITERATIONS ]]; do
@@ -1498,7 +1561,7 @@ run_ralph_loop() {
 
     # Run iteration
     local signal
-    signal=$(run_iteration "$workspace" "$iteration" "$session_id" "$script_dir")
+    signal=$(run_iteration "$workspace" "$iteration" "$script_dir")
 
     local head_after criteria_after done_after
     head_after=$(get_git_head)
@@ -1607,7 +1670,6 @@ run_ralph_loop() {
           echo "🔄 Rotating to fresh context..."
         fi
         iteration=$((iteration + 1))
-        session_id=""
         ;;
       "GUTTER")
         log_progress "$workspace" "**Session $iteration ended** - 🔄 Fresh context after GUTTER"
@@ -1617,7 +1679,6 @@ run_ralph_loop() {
         echo "🔄 Gutter detected. Rotating to fresh context..."
         echo "   Check .ralph/errors.log and .ralph/guardrails.md if the same issue repeats."
         iteration=$((iteration + 1))
-        session_id=""
         ;;
       "THRASH")
         log_progress "$workspace" "**Session $iteration ended** - 🚨 THRASH STOP (repeated rotate-without-progress)"
@@ -1650,6 +1711,15 @@ run_ralph_loop() {
         
         # Don't increment iteration - retry the same task
         echo "   Resuming..."
+        ;;
+      "ABORT")
+        log_progress "$workspace" "**Session $iteration ended** - ❌ Agent launch/runtime failure"
+        append_signal_event "$workspace" "ABORT" "Agent launch/runtime failure" "loop" "$iteration"
+        write_runtime_state "$workspace" "error" "$iteration" "$MODEL" "ABORT" "Agent launch/runtime failure" "loop" ""
+        echo ""
+        echo "❌ Ralph could not start or keep the agent running."
+        echo "   Check .ralph/errors.log and .ralph/activity.log for the raw failure."
+        return 1
         ;;
       *)
         # Agent finished naturally, check if more work needed

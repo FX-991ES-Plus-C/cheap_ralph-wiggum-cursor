@@ -169,7 +169,7 @@ main() {
   
   # Run exactly one iteration
   local signal
-  signal=$(run_iteration "$WORKSPACE" "1" "" "$SCRIPT_DIR")
+  signal=$(run_iteration "$WORKSPACE" "1" "$SCRIPT_DIR")
   
   # Check result
   local task_status

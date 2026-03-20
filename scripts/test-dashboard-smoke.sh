@@ -68,6 +68,11 @@ RALPH_RUNTIME_UPDATED_AT=2026-03-19\ 12:00:00\ EDT
 EOF
 
   cat > "$dir/.ralph/.last-session.env" <<'EOF'
+RALPH_SESSION_ITERATION=1
+RALPH_SESSION_ID=cursor-session-123
+RALPH_SESSION_REQUEST_ID=request-456
+RALPH_SESSION_PERMISSION_MODE=default
+RALPH_SESSION_MODEL=test-model
 RALPH_SESSION_SIGNAL=WARN
 RALPH_SESSION_TOKENS=120
 RALPH_SESSION_BYTES_READ=0
@@ -91,7 +96,7 @@ assert_contains() {
   local file="$1"
   local pattern="$2"
 
-  if ! grep -q "$pattern" "$file"; then
+  if ! grep -Fq -- "$pattern" "$file"; then
     echo "Assertion failed: expected '$pattern' in $file" >&2
     exit 1
   fi
@@ -110,6 +115,94 @@ run_parser_case() {
   assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_SIGNAL=${expected_signal}"
 }
 
+run_auto_model_case() {
+  local workspace fakebin signal
+  workspace="$(make_workspace)"
+  fakebin="$workspace/fakebin"
+  mkdir -p "$fakebin"
+
+  cat > "$fakebin/cursor-agent" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$@" > "$TEST_ARG_FILE"
+printf '%s\n' '{"type":"system","subtype":"init","model":"cursor-default","session_id":"cursor-session-auto","permissionMode":"default"}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"text":"<ralph>COMPLETE</ralph>"}]}}'
+printf '%s\n' '{"type":"result","subtype":"success","result":"OK","session_id":"cursor-session-auto","request_id":"request-auto-123"}'
+EOF
+  chmod +x "$fakebin/cursor-agent"
+
+  (
+    export PATH="$fakebin:$PATH"
+    export TEST_ARG_FILE="$workspace/agent-args.txt"
+    export MODEL=auto
+    export SCRIPT_DIR="$REPO_DIR/scripts"
+    # shellcheck disable=SC1090
+    source "$REPO_DIR/scripts/ralph-common.sh"
+    init_ralph_dir "$workspace"
+    signal="$(run_iteration "$workspace" 1 "$REPO_DIR/scripts")"
+    [[ "$signal" == "COMPLETE" ]]
+  )
+
+  if grep -qx -- '--model' "$workspace/agent-args.txt"; then
+    echo "Assertion failed: MODEL=auto should not pass --model to cursor-agent" >&2
+    exit 1
+  fi
+  if grep -qx -- 'auto' "$workspace/agent-args.txt"; then
+    echo "Assertion failed: MODEL=auto should not be forwarded literally" >&2
+    exit 1
+  fi
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_ID=cursor-session-auto"
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_REQUEST_ID=request-auto-123"
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_PERMISSION_MODE=default"
+}
+
+run_signal_timeline_case() {
+  local workspace
+  workspace="$(make_workspace)"
+
+  cat > "$workspace/.ralph/signals.log" <<'EOF'
+# Signal Log
+
+[2026-03-19 12:00:00] source=loop iteration=1 signal=SESSION_START | model=test
+[2026-03-19 12:00:01] source=loop iteration=1 signal=LOOP_START | max_iterations=5
+[2026-03-19 12:00:02] source=loop iteration=1 signal=THRASH | repeated rotate-without-progress
+[2026-03-19 12:00:03] source=loop iteration=1 signal=ABORT | Agent launch/runtime failure
+EOF
+
+  python3 - "$REPO_DIR/scripts/ralph-tui.py" "$workspace" <<'PY'
+import runpy
+import sys
+from pathlib import Path
+
+ns = runpy.run_path(sys.argv[1], run_name="ralph_tui_test")
+state = ns["load_dashboard_state"](Path(sys.argv[2]))
+
+assert ns["signal_from_line"](
+    "[2026-03-19 12:00:03] source=loop iteration=1 signal=ABORT | Agent launch/runtime failure"
+) == "ABORT"
+assert ns["signal_from_line"](
+    "[2026-03-19 12:00:01] source=loop iteration=1 signal=LOOP_START | max_iterations=5"
+) == "LOOP_START"
+assert state.signal_timeline[-4:] == ["SESSION_START", "LOOP_START", "THRASH", "ABORT"], state.signal_timeline
+assert state.latest_signals[-1].endswith("Agent launch/runtime failure"), state.latest_signals
+assert ns["cursor_session_summary"](state) == "session cursor-session-123 | req request-456 | perm default"
+PY
+}
+
+run_parser_session_metadata_case() {
+  local workspace
+  workspace="$(make_workspace)"
+
+  printf '%s\n' \
+    '{"type":"system","subtype":"init","model":"Cursor Model With Spaces","session_id":"cursor-session-parser","permissionMode":"default"}' \
+    '{"type":"result","subtype":"success","result":"OK","session_id":"cursor-session-parser","request_id":"request-parser-789"}' \
+    | WARN_THRESHOLD=700 ROTATE_THRESHOLD=900 bash "$REPO_DIR/scripts/stream-parser.sh" "$workspace" >"$workspace/parser.out"
+
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_ID=cursor-session-parser"
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_REQUEST_ID=request-parser-789"
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_PERMISSION_MODE=default"
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_MODEL=Cursor\\ Model\\ With\\ Spaces"
+}
+
 main() {
   local workspace snapshot_file
   workspace="$(make_workspace)"
@@ -120,6 +213,7 @@ main() {
   assert_contains "$snapshot_file" "Views:"
   assert_contains "$snapshot_file" "Dashboard shows current task state"
   assert_contains "$snapshot_file" "Timeline:"
+  assert_contains "$snapshot_file" "Cursor: session cursor-session-123 | req request-456 | perm default"
 
   if python3 - <<'PY' >/dev/null 2>&1
 import textual
@@ -143,6 +237,11 @@ PY
     "defer" \
     "DEFER" \
     '{"type":"error","error":{"message":"Rate limit exceeded"}}'
+
+  run_parser_case \
+    "abort" \
+    "ABORT" \
+    'Cannot use this model: auto.'
 
   local rotate_workspace
   rotate_workspace="$(make_workspace)"
@@ -170,6 +269,10 @@ PY
   assert_contains "$gutter_rotate_workspace/.ralph/signals.log" "signal=GUTTER"
   assert_contains "$gutter_rotate_workspace/.ralph/signals.log" "signal=ROTATE"
   assert_contains "$gutter_rotate_workspace/.ralph/.last-session.env" "RALPH_SESSION_SIGNAL=ROTATE"
+
+  run_auto_model_case
+  run_parser_session_metadata_case
+  run_signal_timeline_case
 
   echo "dashboard smoke test passed"
 }

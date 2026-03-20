@@ -53,6 +53,7 @@ ROTATE_SENT=0
 GUTTER_SENT=0
 COMPLETE_SENT=0
 DEFER_SENT=0
+ABORT_SENT=0
 LAST_SIGNAL="NONE"
 LARGE_READ_THRASH_HIT=0
 TOKEN_EST_PROMPT=0
@@ -60,6 +61,10 @@ TOKEN_EST_READ=0
 TOKEN_EST_WRITE=0
 TOKEN_EST_ASSISTANT=0
 TOKEN_EST_SHELL=0
+CURSOR_SESSION_ID=""
+CURSOR_REQUEST_ID=""
+CURSOR_PERMISSION_MODE=""
+CURSOR_MODEL="${RALPH_MODEL_RUNTIME:-unknown}"
 
 # Estimate initial prompt size (Ralph prompt is ~2KB + file references)
 PROMPT_CHARS=3000
@@ -251,6 +256,11 @@ emit_signal_once() {
     "DEFER")
       [[ $DEFER_SENT -eq 1 ]] && return
       DEFER_SENT=1
+      TERMINAL_SIGNAL_SENT=1
+      ;;
+    "ABORT")
+      [[ $ABORT_SENT -eq 1 ]] && return
+      ABORT_SENT=1
       TERMINAL_SIGNAL_SENT=1
       ;;
     *)
@@ -459,31 +469,55 @@ track_file_read() {
 
 write_session_metrics() {
   local summary_file="$RALPH_DIR/.last-session.env"
+  local tmp_file
   local tokens
   tokens=$(calc_tokens)
+  tmp_file=$(mktemp)
 
-  cat > "$summary_file" <<EOF
-RALPH_SESSION_SIGNAL=${LAST_SIGNAL:-NONE}
-RALPH_SESSION_TOKENS=$tokens
-RALPH_SESSION_BYTES_READ=$BYTES_READ
-RALPH_SESSION_BYTES_WRITTEN=$BYTES_WRITTEN
-RALPH_SESSION_ASSISTANT_CHARS=$ASSISTANT_CHARS
-RALPH_SESSION_SHELL_OUTPUT_CHARS=$SHELL_OUTPUT_CHARS
-RALPH_SESSION_TOOL_CALLS=$TOOL_CALLS
-RALPH_SESSION_READ_CALLS=$READ_CALLS
-RALPH_SESSION_WRITE_CALLS=$WRITE_CALLS
-RALPH_SESSION_WORK_WRITE_CALLS=$WORK_WRITE_CALLS
-RALPH_SESSION_SHELL_CALLS=$SHELL_CALLS
-RALPH_SESSION_LARGE_READS=$LARGE_READS
-RALPH_SESSION_LARGE_READ_REREADS=$LARGE_READ_REREADS
-RALPH_SESSION_LARGE_READ_THRASH_HIT=$LARGE_READ_THRASH_HIT
-RALPH_SESSION_PROMPT_TOKENS=$TOKEN_EST_PROMPT
-RALPH_SESSION_READ_TOKENS=$TOKEN_EST_READ
-RALPH_SESSION_WRITE_TOKENS=$TOKEN_EST_WRITE
-RALPH_SESSION_ASSISTANT_TOKENS=$TOKEN_EST_ASSISTANT
-RALPH_SESSION_SHELL_TOKENS=$TOKEN_EST_SHELL
-RALPH_SESSION_TOOL_OVERHEAD_TOKENS=$((TOOL_CALLS * 12))
-EOF
+  {
+    printf 'RALPH_SESSION_ITERATION=%q\n' "${RALPH_ITERATION:-0}"
+    printf 'RALPH_SESSION_ID=%q\n' "$CURSOR_SESSION_ID"
+    printf 'RALPH_SESSION_REQUEST_ID=%q\n' "$CURSOR_REQUEST_ID"
+    printf 'RALPH_SESSION_PERMISSION_MODE=%q\n' "$CURSOR_PERMISSION_MODE"
+    printf 'RALPH_SESSION_MODEL=%q\n' "$CURSOR_MODEL"
+    printf 'RALPH_SESSION_SIGNAL=%q\n' "${LAST_SIGNAL:-NONE}"
+    printf 'RALPH_SESSION_TOKENS=%q\n' "$tokens"
+    printf 'RALPH_SESSION_BYTES_READ=%q\n' "$BYTES_READ"
+    printf 'RALPH_SESSION_BYTES_WRITTEN=%q\n' "$BYTES_WRITTEN"
+    printf 'RALPH_SESSION_ASSISTANT_CHARS=%q\n' "$ASSISTANT_CHARS"
+    printf 'RALPH_SESSION_SHELL_OUTPUT_CHARS=%q\n' "$SHELL_OUTPUT_CHARS"
+    printf 'RALPH_SESSION_TOOL_CALLS=%q\n' "$TOOL_CALLS"
+    printf 'RALPH_SESSION_READ_CALLS=%q\n' "$READ_CALLS"
+    printf 'RALPH_SESSION_WRITE_CALLS=%q\n' "$WRITE_CALLS"
+    printf 'RALPH_SESSION_WORK_WRITE_CALLS=%q\n' "$WORK_WRITE_CALLS"
+    printf 'RALPH_SESSION_SHELL_CALLS=%q\n' "$SHELL_CALLS"
+    printf 'RALPH_SESSION_LARGE_READS=%q\n' "$LARGE_READS"
+    printf 'RALPH_SESSION_LARGE_READ_REREADS=%q\n' "$LARGE_READ_REREADS"
+    printf 'RALPH_SESSION_LARGE_READ_THRASH_HIT=%q\n' "$LARGE_READ_THRASH_HIT"
+    printf 'RALPH_SESSION_PROMPT_TOKENS=%q\n' "$TOKEN_EST_PROMPT"
+    printf 'RALPH_SESSION_READ_TOKENS=%q\n' "$TOKEN_EST_READ"
+    printf 'RALPH_SESSION_WRITE_TOKENS=%q\n' "$TOKEN_EST_WRITE"
+    printf 'RALPH_SESSION_ASSISTANT_TOKENS=%q\n' "$TOKEN_EST_ASSISTANT"
+    printf 'RALPH_SESSION_SHELL_TOKENS=%q\n' "$TOKEN_EST_SHELL"
+    printf 'RALPH_SESSION_TOOL_OVERHEAD_TOKENS=%q\n' "$((TOOL_CALLS * 12))"
+  } > "$tmp_file"
+
+  mv "$tmp_file" "$summary_file"
+}
+
+process_raw_line() {
+  local line="$1"
+  local trimmed="${line//$'\r'/}"
+
+  [[ -n "$trimmed" ]] || return 0
+
+  log_activity "AGENT RAW: $trimmed"
+
+  if [[ "$trimmed" == "Cannot use this model:"* ]]; then
+    emit_signal_once "ABORT" "AGENT RAW: $trimmed" "AGENT CONFIG: $trimmed"
+  else
+    emit_signal_once "ABORT" "AGENT RAW: $trimmed" "AGENT RAW: $trimmed"
+  fi
 }
 
 # Process a single JSON line from stream
@@ -494,14 +528,36 @@ process_line() {
   [[ -z "$line" ]] && return
   
   # Parse JSON type
-  local type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null) || return
+  local type
+  if ! type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null); then
+    process_raw_line "$line"
+    return
+  fi
   local subtype=$(echo "$line" | jq -r '.subtype // empty' 2>/dev/null) || true
   
   case "$type" in
     "system")
       if [[ "$subtype" == "init" ]]; then
         local model=$(echo "$line" | jq -r '.model // "unknown"' 2>/dev/null) || model="unknown"
-        log_activity "SESSION START: model=$model"
+        local session_id=$(echo "$line" | jq -r '.session_id // .sessionId // .chatId // empty' 2>/dev/null) || session_id=""
+        local permission_mode=$(echo "$line" | jq -r '.permissionMode // .permission_mode // empty' 2>/dev/null) || permission_mode=""
+        CURSOR_MODEL="$model"
+        RALPH_MODEL_RUNTIME="$model"
+        if [[ -n "$session_id" ]]; then
+          CURSOR_SESSION_ID="$session_id"
+        fi
+        if [[ -n "$permission_mode" ]]; then
+          CURSOR_PERMISSION_MODE="$permission_mode"
+        fi
+        local session_msg="SESSION START: model=$model"
+        if [[ -n "$CURSOR_SESSION_ID" ]]; then
+          session_msg="$session_msg session=$CURSOR_SESSION_ID"
+        fi
+        if [[ -n "$CURSOR_PERMISSION_MODE" ]]; then
+          session_msg="$session_msg permission=$CURSOR_PERMISSION_MODE"
+        fi
+        log_activity "$session_msg"
+        write_session_metrics
       fi
       ;;
     
@@ -542,6 +598,18 @@ process_line() {
           emit_signal_once "GUTTER" "🚨 Agent signaled GUTTER (stuck)"
         fi
       fi
+      ;;
+
+    "result")
+      local session_id=$(echo "$line" | jq -r '.session_id // .sessionId // .chatId // empty' 2>/dev/null) || session_id=""
+      local request_id=$(echo "$line" | jq -r '.request_id // .requestId // empty' 2>/dev/null) || request_id=""
+      if [[ -n "$session_id" ]]; then
+        CURSOR_SESSION_ID="$session_id"
+      fi
+      if [[ -n "$request_id" ]]; then
+        CURSOR_REQUEST_ID="$request_id"
+      fi
+      write_session_metrics
       ;;
       
     "tool_call")
