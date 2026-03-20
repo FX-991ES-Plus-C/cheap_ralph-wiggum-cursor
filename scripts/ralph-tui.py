@@ -11,6 +11,7 @@ import shlex
 import signal
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import IO, Any
 
@@ -304,6 +305,15 @@ def build_placeholder_state(workspace: Path) -> DashboardState:
     )
 
 
+def append_dashboard_error(workspace: Path, message: str) -> None:
+    ralph_dir = workspace / ".ralph"
+    ralph_dir.mkdir(parents=True, exist_ok=True)
+    error_file = ralph_dir / "errors.log"
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    with error_file.open("a", encoding="utf-8") as handle:
+        handle.write(f"[{timestamp}] dashboard: {message}\n")
+
+
 def render_progress_bar(done_count: int, total_count: int, width: int = 20) -> str:
     if total_count <= 0:
         return "[" + "." * width + "]"
@@ -349,6 +359,12 @@ def render_snapshot(state: DashboardState) -> str:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    child_args: list[str] = []
+    if "--" in argv:
+        separator = argv.index("--")
+        child_args = argv[separator + 1 :]
+        argv = argv[:separator]
+
     parser = argparse.ArgumentParser(description="Ralph Textual dashboard")
     parser.add_argument(
         "first",
@@ -362,12 +378,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="render a plain-text snapshot and exit",
     )
-    parser.add_argument(
-        "child_args",
-        nargs=argparse.REMAINDER,
-        help="arguments passed to ralph-loop.sh after --",
-    )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.child_args = child_args
+    return args
 
 
 def normalize_args(args: argparse.Namespace) -> tuple[str, Path, list[str]]:
@@ -385,10 +398,7 @@ def normalize_args(args: argparse.Namespace) -> tuple[str, Path, list[str]]:
     if workspace is None:
         workspace = "."
 
-    child_args = list(args.child_args)
-    if child_args and child_args[0] == "--":
-        child_args = child_args[1:]
-    return mode, Path(workspace).resolve(), child_args
+    return mode, Path(workspace).resolve(), list(args.child_args)
 
 
 def require_textual() -> None:
@@ -774,15 +784,23 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
 
             env = os.environ.copy()
             env["RALPH_TUI_ACTIVE"] = "1"
+            try:
+                self.child_process = await asyncio.create_subprocess_exec(
+                    str(loop_script),
+                    *self.child_args,
+                    stdout=self.console_handle,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=self.workspace,
+                    env=env,
+                    start_new_session=True,
+                )
+            except Exception as exc:
+                message = f"Failed to launch Ralph loop: {exc}"
+                append_dashboard_error(self.workspace, message)
+                await self.close_console_handle()
+                self.set_note(message)
+                return
 
-            self.child_process = await asyncio.create_subprocess_exec(
-                [str(loop_script), *self.child_args],
-                stdout=self.console_handle,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=self.workspace,
-                env=env,
-                start_new_session=True,
-            )
             self.child_wait_task = asyncio.create_task(self.wait_for_child_loop())
             self.set_note("Launched Ralph loop in the background.")
 
