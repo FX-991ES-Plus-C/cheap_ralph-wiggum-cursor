@@ -461,8 +461,18 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 yield Static("", classes="file-body")
 
         def set_state(self, state: FileViewState) -> None:
-            self.query_one(".file-meta", Static).update(state.meta)
-            self.query_one(".file-body", Static).update(state.body)
+            meta_widget = self.query_one(".file-meta", Static)
+            body_widget = self.query_one(".file-body", Static)
+            last_meta = getattr(self, "_last_meta", None)
+            last_body = getattr(self, "_last_body", None)
+
+            if state.meta != last_meta:
+                meta_widget.update(Text(state.meta, no_wrap=True, overflow="ellipsis"))
+                self._last_meta = state.meta
+
+            if state.body != last_body:
+                body_widget.update(Text(state.body))
+                self._last_body = state.body
 
         def scroll_line_up(self) -> None:
             self.query_one(VerticalScroll).scroll_up(animate=False)
