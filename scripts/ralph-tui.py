@@ -15,7 +15,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Callable
 
 
 LOG_TAIL_LIMITS = {
@@ -25,8 +25,12 @@ LOG_TAIL_LIMITS = {
     "console": 2500,
 }
 FOLLOWABLE_VIEWS = {"activity", "progress", "signals", "errors", "console"}
-COMPANION_ORDER = ("tasks", "activity", "console", "progress", "signals", "errors")
+COMPANION_ORDER = ("signals", "progress", "tasks", "errors", "console", "activity")
 STALE_AFTER_SECONDS = 90
+TOKEN_BUDGET = 200000
+WIDESCREEN_MIN_WIDTH = 150
+WIDESCREEN_MIN_HEIGHT = 42
+SIDEBAR_MIN_WIDTH = 160
 
 VIEW_ORDER = ("activity", "progress", "tasks", "signals", "errors", "console")
 VIEW_LABELS = {
@@ -98,6 +102,30 @@ VIEW_FILTER_ORDER = {
     "errors": ("all", "errors"),
     "console": ("all", "interesting", "signals", "errors"),
 }
+VIEW_ALIASES = {
+    "activity": "activity",
+    "act": "activity",
+    "progress": "progress",
+    "prog": "progress",
+    "tasks": "tasks",
+    "task": "tasks",
+    "todo": "tasks",
+    "signals": "signals",
+    "signal": "signals",
+    "errors": "errors",
+    "error": "errors",
+    "console": "console",
+    "log": "console",
+}
+FILTER_ALIASES = {
+    "all": "all",
+    "interesting": "interesting",
+    "interesting-only": "interesting",
+    "signals": "signals",
+    "signal": "signals",
+    "errors": "errors",
+    "error": "errors",
+}
 
 
 @dataclass
@@ -139,6 +167,63 @@ class DashboardState:
     views: dict[str, FileViewState]
 
 
+@dataclass
+class SessionTelemetry:
+    bytes_read: int
+    bytes_written: int
+    assistant_chars: int
+    shell_output_chars: int
+    tool_calls: int
+    read_calls: int
+    write_calls: int
+    work_write_calls: int
+    shell_calls: int
+    large_reads: int
+    large_read_rereads: int
+    large_read_thrash_hit: bool
+    hot_file: str
+    hot_file_reads: int
+    hot_file_bytes: int
+    hot_file_lines: int
+    thrash_path: str
+    prompt_tokens: int
+    read_tokens: int
+    write_tokens: int
+    assistant_tokens: int
+    shell_tokens: int
+    tool_overhead_tokens: int
+
+
+@dataclass
+class FeedbackSource:
+    view_name: str
+    label: str
+    pulse: str
+    age_seconds: int | None
+    line_count: int
+    preview: str
+
+
+@dataclass(frozen=True)
+class TaskChecklistItem:
+    raw_line: int
+    label: str
+    done: bool
+
+
+@dataclass(frozen=True)
+class SignalSidebarItem:
+    raw_line: int
+    signal: str
+    line: str
+
+
+@dataclass(frozen=True)
+class CommandIntent:
+    kind: str
+    argument: str = ""
+
+
 def decode_shell_value(raw: str) -> str:
     raw = raw.strip()
     if not raw:
@@ -171,6 +256,124 @@ def read_file_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
+def int_value(raw: str | int | None, default: int = 0) -> int:
+    if raw is None:
+        return default
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return default
+
+
+def format_bytes(value: int) -> str:
+    size = max(value, 0)
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f}MB"
+    if size >= 1024:
+        return f"{size / 1024:.1f}KB"
+    return f"{size}B"
+
+
+def format_count(value: int) -> str:
+    number = max(value, 0)
+    if number >= 1_000_000:
+        return f"{number / 1_000_000:.1f}M"
+    if number >= 1_000:
+        return f"{number / 1_000:.1f}k"
+    return str(number)
+
+
+def format_age(seconds: int | None) -> str:
+    if seconds is None:
+        return "n/a"
+    if seconds <= 0:
+        return "now"
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def clip_text(text: str, width: int = 72) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= width:
+        return compact
+    return compact[: max(width - 3, 0)].rstrip() + "..."
+
+
+def clip_middle(text: str, width: int = 36) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= width:
+        return compact
+    if width <= 7:
+        return compact[:width]
+    prefix = (width - 3) // 2
+    suffix = width - 3 - prefix
+    return compact[:prefix] + "..." + compact[-suffix:]
+
+
+def resolve_view_alias(raw: str) -> str | None:
+    return VIEW_ALIASES.get(raw.strip().lower())
+
+
+def resolve_filter_alias(raw: str) -> str | None:
+    return FILTER_ALIASES.get(raw.strip().lower())
+
+
+def normalize_toggle_argument(raw: str) -> str:
+    lowered = raw.strip().lower()
+    if lowered in {"on", "show", "open", "enable", "enabled"}:
+        return "on"
+    if lowered in {"off", "hide", "close", "disable", "disabled"}:
+        return "off"
+    return "toggle"
+
+
+def parse_command_bar_input(raw: str) -> CommandIntent:
+    command = raw.strip()
+    if not command:
+        return CommandIntent("noop")
+
+    if command.startswith("/"):
+        return CommandIntent("search", command[1:].strip())
+
+    lowered = command.lower()
+    parts = lowered.split()
+    if not parts:
+        return CommandIntent("noop")
+
+    head = parts[0]
+    if head in {"help", "?"}:
+        return CommandIntent("help")
+    if head in {"refresh", "reload"}:
+        return CommandIntent("refresh")
+    if head in {"stop", "halt", "terminate", "kill"}:
+        return CommandIntent("stop")
+    if head in {"hot", "hotspot", "thrash"}:
+        return CommandIntent("hot")
+    if head in {"search", "find"}:
+        return CommandIntent("search", command.split(None, 1)[1].strip() if len(command.split(None, 1)) > 1 else "")
+    if head in {"split", "sidebar", "follow"}:
+        argument = normalize_toggle_argument(parts[1]) if len(parts) > 1 else "toggle"
+        return CommandIntent(head, argument)
+    if head in {"filter", "mode"} and len(parts) > 1:
+        if mode := resolve_filter_alias(parts[1]):
+            return CommandIntent("filter", mode)
+    if head in {"view", "show", "focus", "open"} and len(parts) > 1:
+        if view_name := resolve_view_alias(parts[1]):
+            return CommandIntent("view", view_name)
+    if head in {"buddy", "companion", "pin"} and len(parts) > 1:
+        if view_name := resolve_view_alias(parts[1]):
+            return CommandIntent("buddy", view_name)
+    if view_name := resolve_view_alias(head):
+        return CommandIntent("view", view_name)
+
+    return CommandIntent("search", command)
+
+
 def count_task_progress(task_file: Path) -> tuple[int, int]:
     if not task_file.exists():
         return 0, 0
@@ -193,6 +396,34 @@ def count_task_progress(task_file: Path) -> tuple[int, int]:
         elif "[ ]" in stripped:
             total += 1
     return done, total
+
+
+def tracked_task_items(task_file: Path) -> list[TaskChecklistItem]:
+    if not task_file.exists():
+        return []
+
+    items: list[TaskChecklistItem] = []
+    for raw_line, line in enumerate(
+        task_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    ):
+        stripped = line.lstrip()
+        if not stripped:
+            continue
+        if not (
+            stripped.startswith("- [")
+            or stripped.startswith("* [")
+            or (stripped[0].isdigit() and ". [" in stripped[:8])
+        ):
+            continue
+
+        lowered = stripped.lower()
+        done = "[x]" in lowered
+        if not done and "[ ]" not in stripped:
+            continue
+        marker_index = lowered.find("[x]") if done else stripped.find("[ ]")
+        label = stripped[marker_index + 3 :].strip() if marker_index != -1 else stripped
+        items.append(TaskChecklistItem(raw_line=raw_line, label=label, done=done))
+    return items
 
 
 def next_task_label(task_file: Path) -> str:
@@ -237,7 +468,7 @@ def latest_token_summary(activity_file: Path, session: dict[str, str]) -> tuple[
         token_count = 0
 
     if token_count > 0:
-        token_pct = int(token_count * 100 / 200000)
+        token_pct = int(token_count * 100 / TOKEN_BUDGET)
     return token_count, token_pct
 
 
@@ -303,6 +534,34 @@ def health_label(token_pct: int) -> str:
     return "CHILL"
 
 
+def session_telemetry(session: dict[str, str]) -> SessionTelemetry:
+    return SessionTelemetry(
+        bytes_read=int_value(session.get("RALPH_SESSION_BYTES_READ")),
+        bytes_written=int_value(session.get("RALPH_SESSION_BYTES_WRITTEN")),
+        assistant_chars=int_value(session.get("RALPH_SESSION_ASSISTANT_CHARS")),
+        shell_output_chars=int_value(session.get("RALPH_SESSION_SHELL_OUTPUT_CHARS")),
+        tool_calls=int_value(session.get("RALPH_SESSION_TOOL_CALLS")),
+        read_calls=int_value(session.get("RALPH_SESSION_READ_CALLS")),
+        write_calls=int_value(session.get("RALPH_SESSION_WRITE_CALLS")),
+        work_write_calls=int_value(session.get("RALPH_SESSION_WORK_WRITE_CALLS")),
+        shell_calls=int_value(session.get("RALPH_SESSION_SHELL_CALLS")),
+        large_reads=int_value(session.get("RALPH_SESSION_LARGE_READS")),
+        large_read_rereads=int_value(session.get("RALPH_SESSION_LARGE_READ_REREADS")),
+        large_read_thrash_hit=int_value(session.get("RALPH_SESSION_LARGE_READ_THRASH_HIT")) > 0,
+        hot_file=session.get("RALPH_SESSION_HOT_FILE", "").strip(),
+        hot_file_reads=int_value(session.get("RALPH_SESSION_HOT_FILE_READS")),
+        hot_file_bytes=int_value(session.get("RALPH_SESSION_HOT_FILE_BYTES")),
+        hot_file_lines=int_value(session.get("RALPH_SESSION_HOT_FILE_LINES")),
+        thrash_path=session.get("RALPH_SESSION_THRASH_PATH", "").strip(),
+        prompt_tokens=int_value(session.get("RALPH_SESSION_PROMPT_TOKENS")),
+        read_tokens=int_value(session.get("RALPH_SESSION_READ_TOKENS")),
+        write_tokens=int_value(session.get("RALPH_SESSION_WRITE_TOKENS")),
+        assistant_tokens=int_value(session.get("RALPH_SESSION_ASSISTANT_TOKENS")),
+        shell_tokens=int_value(session.get("RALPH_SESSION_SHELL_TOKENS")),
+        tool_overhead_tokens=int_value(session.get("RALPH_SESSION_TOOL_OVERHEAD_TOKENS")),
+    )
+
+
 def select_task_file(workspace: Path) -> Path:
     alt = workspace / "ralph-tasks.md"
     if alt.exists():
@@ -320,6 +579,13 @@ def view_paths_for_workspace(workspace: Path, task_file: Path) -> dict[str, Path
         "errors": ralph_dir / "errors.log",
         "console": ralph_dir / "tui-run.log",
     }
+
+
+def age_for_path(path: Path) -> int | None:
+    timestamp = file_timestamp(path)
+    if timestamp is None:
+        return None
+    return max(int((datetime.now() - timestamp).total_seconds()), 0)
 
 
 def build_empty_view_state(path: Path, view_name: str, headline: str) -> FileViewState:
@@ -374,6 +640,27 @@ def build_view_state(path: Path, view_name: str) -> FileViewState:
     )
 
 
+def latest_content_line(body: str, predicate: Callable[[str], bool] | None = None) -> str:
+    for raw_line in reversed(strip_tail_header(body.splitlines())):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("[showing last "):
+            continue
+        if stripped.startswith("#"):
+            continue
+        if stripped.startswith("<!--"):
+            continue
+        if stripped in {"---", "```"}:
+            continue
+        if stripped.startswith(">"):
+            continue
+        if predicate is not None and not predicate(stripped):
+            continue
+        return stripped
+    return ""
+
+
 def parse_runtime_timestamp(raw: str) -> datetime | None:
     cleaned = raw.strip()
     if len(cleaned) < 19:
@@ -410,6 +697,25 @@ def recent_signal_timeline(lines: list[str]) -> list[str]:
     if not timeline:
         return ["NONE"]
     return timeline[-6:]
+
+
+def recent_signal_items(signals_file: Path, limit: int = 40) -> list[SignalSidebarItem]:
+    if not signals_file.exists():
+        return []
+
+    items: list[SignalSidebarItem] = []
+    for raw_line, line in enumerate(
+        signals_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    ):
+        if signal_name := signal_from_line(line):
+            items.append(
+                SignalSidebarItem(
+                    raw_line=raw_line,
+                    signal=signal_name,
+                    line=clip_text(line, width=120),
+                )
+            )
+    return items[-limit:]
 
 
 def errorish_line(line: str) -> bool:
@@ -454,6 +760,79 @@ def interesting_line(line: str) -> bool:
         or "gutter" in lowered
         or "rotate" in lowered
     )
+
+
+def token_mix_rows(telemetry: SessionTelemetry) -> list[tuple[str, int]]:
+    return [
+        ("Prompt", telemetry.prompt_tokens),
+        ("Read", telemetry.read_tokens),
+        ("Write", telemetry.write_tokens),
+        ("Assist", telemetry.assistant_tokens),
+        ("Shell", telemetry.shell_tokens),
+        ("Tools", telemetry.tool_overhead_tokens),
+    ]
+
+
+def feedback_preview_for_view(view_name: str, state: DashboardState) -> str:
+    view_state = state.views[view_name]
+    if view_name == "tasks":
+        if state.total_count <= 0:
+            return "No tracked criteria yet."
+        return f"{state.done_count}/{state.total_count} done | next: {state.next_task}"
+    if view_name == "signals":
+        return state.latest_signals[-1] if state.latest_signals else "No signals yet."
+    if view_name == "errors":
+        preview = latest_content_line(view_state.body, predicate=errorish_line)
+        return preview or "No errors logged."
+    if view_name == "console":
+        preview = latest_content_line(view_state.body)
+        return preview or "Console waiting for Ralph output."
+    if view_name == "progress":
+        preview = latest_content_line(view_state.body)
+        return preview or "Progress journal waiting for fresh notes."
+    if view_name == "activity":
+        preview = latest_content_line(view_state.body)
+        return preview or "Activity log waiting for tool traces."
+    preview = latest_content_line(view_state.body)
+    return preview or f"{VIEW_LABELS[view_name]} is standing by."
+
+
+def feedback_pulse_for_view(view_name: str, state: DashboardState) -> str:
+    view_state = state.views[view_name]
+    if view_name == "tasks":
+        if state.total_count <= 0:
+            return "no criteria"
+        return f"{state.done_count}/{state.total_count} done"
+    if view_name == "signals":
+        return state.runtime["RALPH_RUNTIME_LAST_SIGNAL"]
+    if view_name == "errors":
+        preview = latest_content_line(view_state.body, predicate=errorish_line)
+        return "attention" if preview else "clear"
+    if view_name == "console":
+        status = state.runtime["RALPH_RUNTIME_STATUS"].lower()
+        return "live" if status in {"running", "starting", "rotating", "gutter"} else "idle"
+    if view_name == "activity":
+        return f"{view_state.line_count} lines"
+    if view_name == "progress":
+        return f"{view_state.line_count} lines"
+    return f"{view_state.line_count} lines"
+
+
+def build_feedback_sources(state: DashboardState) -> list[FeedbackSource]:
+    sources: list[FeedbackSource] = []
+    for view_name in VIEW_ORDER:
+        view_state = state.views[view_name]
+        sources.append(
+            FeedbackSource(
+                view_name=view_name,
+                label=VIEW_LABELS[view_name],
+                pulse=feedback_pulse_for_view(view_name, state),
+                age_seconds=age_for_path(view_state.path),
+                line_count=view_state.line_count,
+                preview=clip_text(feedback_preview_for_view(view_name, state), width=88),
+            )
+        )
+    return sources
 
 
 def mood_snapshot(state: DashboardState) -> tuple[str, str, str]:
@@ -511,7 +890,7 @@ def load_dashboard_state(workspace: Path) -> DashboardState:
     signals_file = ralph_dir / "signals.log"
     if signals_file.exists():
         signal_lines = signals_file.read_text(encoding="utf-8", errors="replace").splitlines()
-        latest_signals = signal_lines[-4:]
+        latest_signals = [line for line in signal_lines if signal_from_line(line)][-4:]
 
     view_paths = view_paths_for_workspace(workspace, task_file)
     views = {
@@ -648,6 +1027,9 @@ def render_progress_bar(done_count: int, total_count: int, width: int = 20) -> s
 
 
 def render_snapshot(state: DashboardState) -> str:
+    telemetry = session_telemetry(state.session)
+    token_rows = token_mix_rows(telemetry)
+    token_total = sum(value for _, value in token_rows)
     lines = [
         "Ralph Dashboard",
         f"Workspace: {state.workspace}",
@@ -673,9 +1055,32 @@ def render_snapshot(state: DashboardState) -> str:
         f"Next: {state.next_task}",
         (
             "Tokens: "
-            f"{state.token_count}/200000 ({state.token_pct}%) "
+            f"{state.token_count}/{TOKEN_BUDGET} ({state.token_pct}%) "
             f"health:{state.health_label}"
         ),
+        (
+            "Telemetry: "
+            f"reads {telemetry.read_calls} ({format_bytes(telemetry.bytes_read)})  "
+            f"writes {telemetry.write_calls} ({format_bytes(telemetry.bytes_written)})  "
+            f"shell {telemetry.shell_calls}  tools {telemetry.tool_calls}"
+        ),
+        (
+            "Hot file: "
+            + (
+                f"{telemetry.hot_file} x{telemetry.hot_file_reads} "
+                f"({format_bytes(telemetry.hot_file_bytes)}, {telemetry.hot_file_lines} lines)"
+                if telemetry.hot_file
+                else "none"
+            )
+        ),
+        "Token Mix: "
+        + ", ".join(
+            f"{label.lower()} {value}/{token_total or 1}"
+            for label, value in token_rows
+            if value > 0
+        )
+        if token_total > 0
+        else "Token Mix: waiting for session telemetry",
         f"Timeline: {' > '.join(state.signal_timeline)}",
         (
             "Freshness: "
@@ -686,12 +1091,69 @@ def render_snapshot(state: DashboardState) -> str:
             )
         ),
         "Views: activity progress tasks signals errors console",
+        "Sources:",
+        *[
+            (
+                f"- {source.label}: {source.pulse} | age:{format_age(source.age_seconds)} "
+                f"| lines:{source.line_count} | {source.preview}"
+            )
+            for source in build_feedback_sources(state)
+        ],
         "",
         f"Pane: {VIEW_LABELS['tasks']}",
         state.views["tasks"].meta,
         state.views["tasks"].body.rstrip(),
     ]
     return "\n".join(lines) + "\n"
+
+
+def dashboard_help_markdown() -> str:
+    return """\
+# Ralph Dashboard Help
+
+Ralph is telemetry-first: the top cockpit shows overall run health, while the side rail and panes help you drill into the source of movement or trouble.
+
+## Layout
+
+- Command bar: type commands like `tasks`, `signals`, `filter interesting`, `hot`, `stop`, or any plain text to search the active pane.
+- Side rail: quick navigation for watch sources, checklist items, and recent signals.
+- Main pane: full log / markdown / checklist view.
+- Buddy pane: an always-on secondary pane on roomy screens.
+
+## Useful Keys
+
+| Key | Action |
+| -- | -- |
+| `/` or `:` | Focus the command bar |
+| `Ctrl+f` | Open incremental search for the active pane |
+| `Ctrl+n` | Show or hide the side rail |
+| `1-6` | Switch main panes |
+| `tab`, `shift+tab`, `left`, `right` | Cycle panes |
+| `j`, `k`, `up`, `down`, `pgup`, `pgdn`, `g`, `G` | Scroll |
+| `f` | Toggle follow for live panes |
+| `v`, `V` | Cycle the active pane filter |
+| `s` | Toggle split buddy pane |
+| `b`, `B` | Cycle the buddy pane |
+| `t`, `T` | Jump between unchecked tasks |
+| `[`, `]` | Jump between Ralph signal markers |
+| `r` | Refresh now |
+| `x` | Stop a dashboard-launched loop |
+| `?` | Toggle the inline shortcut strip |
+| `F1` | Open this full help |
+| `q` | Quit the dashboard |
+
+## Command Bar Examples
+
+- `tasks`
+- `signals`
+- `buddy progress`
+- `filter interesting`
+- `follow off`
+- `hot`
+- `search rotate`
+
+Any unrecognized text is treated as a search query for the active pane.
+"""
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -752,9 +1214,11 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
     from rich.text import Text
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.containers import Container, Horizontal, Vertical, VerticalScroll
-    from textual.events import Key
-    from textual.widgets import Footer, Header, Input, Static, TabPane, TabbedContent
+    from textual.containers import Center, Container, Horizontal, Vertical, VerticalScroll
+    from textual.events import Key, Resize
+    from textual.screen import ModalScreen
+    from textual.widgets import Button, Footer, Header, Input, Markdown, OptionList, Static, TabPane, TabbedContent
+    from textual.widgets.option_list import Option
 
     @dataclass
     class PaletteCommand:
@@ -762,6 +1226,82 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
         action_name: str
         aliases: str
         description: str
+
+    class HelpModal(ModalScreen[None]):
+        DEFAULT_CSS = """
+        HelpModal {
+            align: center middle;
+        }
+
+        HelpModal > Vertical {
+            border: thick #2a6f97;
+            width: 82%;
+            height: 82%;
+            background: #0d1b2a;
+        }
+
+        HelpModal > Vertical > VerticalScroll {
+            height: 1fr;
+            margin: 1 2;
+        }
+
+        HelpModal > Vertical > Center {
+            padding: 1;
+            height: auto;
+        }
+        """
+
+        BINDINGS = [
+            Binding("escape,f1", "dismiss(None)", show=False),
+        ]
+
+        def compose(self) -> ComposeResult:
+            with Vertical():
+                with VerticalScroll():
+                    yield Markdown(dashboard_help_markdown())
+                with Center():
+                    yield Button("Close", variant="primary")
+
+        def on_mount(self) -> None:
+            self.query_one(Markdown).can_focus_children = False
+            self.query_one("Vertical > VerticalScroll").focus()
+
+        def on_button_pressed(self) -> None:
+            self.dismiss(None)
+
+    class WatchEntry(Option):
+        def __init__(self, source: FeedbackSource) -> None:
+            prompt = Text()
+            prompt.append(source.label, style="bold #8ecae6")
+            prompt.append(f"  {source.pulse}", style="bold #ffd166")
+            prompt.append(
+                f"\n{format_age(source.age_seconds)} · {source.line_count} lines",
+                style="dim #bde0fe",
+            )
+            prompt.append(f"\n{source.preview}", style="#f7f4ea")
+            super().__init__(prompt)
+            self.view_name = source.view_name
+
+    class TaskEntry(Option):
+        def __init__(self, item: TaskChecklistItem) -> None:
+            marker = "[x]" if item.done else "[ ]"
+            self.label_text = clip_text(item.label, width=72)
+            prompt = Text()
+            prompt.append(marker, style="dim #2a9d8f" if item.done else "bold #ffd166")
+            prompt.append(" ")
+            prompt.append(self.label_text, style="#f7f4ea")
+            super().__init__(prompt)
+            self.raw_line = item.raw_line
+            self.done = item.done
+
+    class SignalEntry(Option):
+        def __init__(self, item: SignalSidebarItem) -> None:
+            prompt = Text()
+            prompt.append(item.signal, style=SIGNAL_STYLES.get(item.signal, DEFAULT_SIGNAL_STYLE))
+            prompt.append(f"\n{item.line}", style="#f7f4ea")
+            super().__init__(prompt)
+            self.raw_line = item.raw_line
+            self.signal = item.signal
 
     class AutoFollowScroll(VerticalScroll):
         def watch_scroll_y(self, old_value: float, new_value: float) -> None:
@@ -1135,6 +1675,16 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 self.scroll_to_latest()
             return self._filter_mode
 
+        def set_filter_mode(self, mode: str) -> str:
+            filters = self.supported_filters()
+            self._filter_mode = mode if mode in filters else filters[0]
+            self._rebuild_display_body()
+            self.refresh_meta()
+            self.refresh_body()
+            if self.follow_output and self.auto_follow:
+                self.scroll_to_latest()
+            return self._filter_mode
+
         def search_query(self) -> str:
             return self._search_query
 
@@ -1234,6 +1784,16 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             ]
             return self._cycle_to_lines(marker_lines, backwards=backwards)
 
+        def jump_to_raw_line(self, raw_line: int) -> bool:
+            try:
+                line_index = self._display_raw_line_map.index(raw_line)
+            except ValueError:
+                return False
+            self._attention_raw_line = raw_line
+            self.refresh_body()
+            self.scroll_to_line(line_index, pause_follow=True)
+            return True
+
         def sync_follow_state_after_manual_scroll(self) -> None:
             if not self.follow_output or self._suspend_follow_tracking:
                 return
@@ -1291,8 +1851,19 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
 
         #cards {
             height: auto;
+            layout: vertical;
+            padding: 1 1 0 1;
+        }
+
+        #cards-top {
+            height: auto;
             layout: horizontal;
-            padding: 1;
+            margin-bottom: 1;
+        }
+
+        #cards-bottom {
+            height: auto;
+            layout: horizontal;
         }
 
         .card {
@@ -1301,7 +1872,13 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             margin-right: 1;
         }
 
-        #signal-card {
+        #telemetry-card {
+            margin-right: 0;
+        }
+
+        #feedback-card {
+            width: 2fr;
+            min-height: 11;
             margin-right: 0;
         }
 
@@ -1329,6 +1906,25 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
 
         #celebration-strip.hidden {
             display: none;
+        }
+
+        #command-bar {
+            height: auto;
+            padding: 0 1;
+            background: #0f1724;
+            color: #fefae0;
+            layout: horizontal;
+        }
+
+        #command-label {
+            width: auto;
+            padding-right: 1;
+            color: #ffd166;
+            text-style: bold;
+        }
+
+        #command-input {
+            width: 1fr;
         }
 
         #search-bar {
@@ -1381,14 +1977,59 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             layout: horizontal;
         }
 
+        #sidebar {
+            width: 38;
+            min-width: 34;
+            height: 1fr;
+            margin: 0 0 1 1;
+            border: round #415a77;
+            background: #0d1b2a;
+        }
+
+        #sidebar.hidden {
+            display: none;
+        }
+
+        #sidebar-label {
+            height: auto;
+            padding: 0 1;
+            background: #1d3557;
+            color: #ffd166;
+            text-style: bold;
+        }
+
+        #sidebar-tabs {
+            height: 1fr;
+        }
+
+        #sidebar-tabs Tabs {
+            border: blank;
+            height: 3;
+        }
+
+        #sidebar-tabs TabPane {
+            padding: 0;
+            border: blank;
+        }
+
+        .rail-list {
+            height: 1fr;
+            border: none;
+            background: #0d1117;
+        }
+
+        .rail-list:focus {
+            border: heavy #ffd166;
+        }
+
         #primary-column {
-            width: 2fr;
+            width: 5fr;
             height: 1fr;
         }
 
         #companion-column {
-            width: 1fr;
-            min-width: 36;
+            width: 3fr;
+            min-width: 42;
             height: 1fr;
             margin: 0 1 1 0;
         }
@@ -1447,16 +2088,19 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             Binding("s", "toggle_split", show=False),
             Binding("b", "cycle_companion", show=False),
             Binding("B", "cycle_companion_reverse", show=False),
-            Binding("slash", "open_search", show=False),
+            Binding("slash", "focus_command_bar", show=False),
             Binding("n", "search_next", show=False),
             Binding("N", "search_previous", show=False),
             Binding("t", "jump_next_task", show=False),
             Binding("T", "jump_previous_task", show=False),
             Binding("right_square_bracket", "jump_next_signal", show=False),
             Binding("left_square_bracket", "jump_previous_signal", show=False),
-            Binding("colon", "open_palette", show=False),
+            Binding("colon", "focus_command_bar", show=False),
+            Binding("ctrl+f", "open_search", show=False),
+            Binding("ctrl+n", "toggle_sidebar", "Side Rail", show=True),
             Binding("ctrl+p", "open_palette", show=False),
             Binding("escape", "cancel_overlay", show=False),
+            Binding("f1", "show_help", show=False),
             Binding("r", "refresh_now", "Refresh", show=True),
             Binding("question_mark", "toggle_help", "Help", show=True),
             Binding("x", "stop_loop", "Stop Loop", show=True),
@@ -1480,7 +2124,9 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             self.palette_matches: list[PaletteCommand] = []
             self.unread_counts = {view_name: 0 for view_name in VIEW_ORDER}
             self.split_mode = False
-            self.companion_view_name = "tasks"
+            self.companion_view_name = "signals"
+            self.widescreen_defaults_applied = False
+            self.sidebar_visible = False
             self.child_process: asyncio.subprocess.Process | None = None
             self.child_exit_code = 0
             self.console_handle: IO[str] | None = None
@@ -1490,10 +2136,20 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
             with Container(id="body"):
-                with Horizontal(id="cards"):
-                    yield Static(classes="card", id="hero-card")
-                    yield Static(classes="card", id="progress-card")
-                    yield Static(classes="card", id="signal-card")
+                with Vertical(id="cards"):
+                    with Horizontal(id="cards-top"):
+                        yield Static(classes="card", id="hero-card")
+                        yield Static(classes="card", id="progress-card")
+                        yield Static(classes="card", id="telemetry-card")
+                    with Horizontal(id="cards-bottom"):
+                        yield Static(classes="card", id="token-card")
+                        yield Static(classes="card", id="feedback-card")
+                with Horizontal(id="command-bar"):
+                    yield Static("Command", id="command-label")
+                    yield Input(
+                        placeholder="Type a command or search the active pane",
+                        id="command-input",
+                    )
                 yield Static(id="help-strip")
                 yield Static(id="timeline-strip")
                 yield Static(id="celebration-strip", classes="hidden")
@@ -1505,6 +2161,15 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                     yield Input(placeholder="Type a command and press Enter", id="palette-input")
                     yield Static(id="palette-results")
                 with Horizontal(id="content-row"):
+                    with Vertical(id="sidebar", classes="hidden"):
+                        yield Static(id="sidebar-label")
+                        with TabbedContent(id="sidebar-tabs", initial="watch"):
+                            with TabPane("Watch", id="watch"):
+                                yield OptionList(id="watch-list", classes="rail-list")
+                            with TabPane("Tasks", id="rail-tasks"):
+                                yield OptionList(id="task-list", classes="rail-list")
+                            with TabPane("Signals", id="rail-signals"):
+                                yield OptionList(id="signal-list", classes="rail-list")
                     with Vertical(id="primary-column"):
                         with TabbedContent(id="views", initial="activity"):
                             with TabPane("1 Activity", id="activity"):
@@ -1529,9 +2194,13 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             self.sub_title = str(self.workspace)
             if self.console_path.parent.exists():
                 self.console_path.touch()
+            self.apply_widescreen_defaults()
+            self.update_command_bar()
             self.update_tab_labels()
             self.update_timeline_strip()
             self.update_celebration_strip()
+            self.update_sidebar_layout()
+            self.update_sidebar()
             self.update_split_layout()
             self.schedule_refresh()
             self.set_interval(0.5, self.schedule_refresh)
@@ -1540,14 +2209,36 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             if self.smoke_exit:
                 self.set_timer(0.2, self.exit)
 
+        def apply_widescreen_defaults(self) -> None:
+            if self.widescreen_defaults_applied:
+                return
+            if self.size.height < WIDESCREEN_MIN_HEIGHT:
+                return
+            if self.size.width >= WIDESCREEN_MIN_WIDTH:
+                self.split_mode = True
+            if self.size.width >= SIDEBAR_MIN_WIDTH:
+                self.sidebar_visible = True
+            self.companion_view_name = "signals"
+            self.widescreen_defaults_applied = True
+            self.note = "Wide-screen cockpit enabled with rail and buddy panes."
+
+        def on_resize(self, event: Resize) -> None:
+            del event
+            self.apply_widescreen_defaults()
+            self.update_sidebar_layout()
+            self.update_status_strip()
+
         def active_view_name(self) -> str:
-            return self.query_one(TabbedContent).active or "activity"
+            return self.query_one("#views", TabbedContent).active or "activity"
 
         def active_file_view(self) -> FileView:
             return self.query_one(f"#{self.active_view_name()}-view", FileView)
 
         def search_input(self) -> Input:
             return self.query_one("#search-input", Input)
+
+        def command_input(self) -> Input:
+            return self.query_one("#command-input", Input)
 
         def palette_input(self) -> Input:
             return self.query_one("#palette-input", Input)
@@ -1561,6 +2252,50 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                     self.companion_view_name = candidate
                     return candidate
             return self.companion_view_name
+
+        def update_command_bar(self) -> None:
+            state = self.last_state
+            hints = ["tasks", "signals", "filter interesting", "hot", "stop"]
+            if state.runtime.get("RALPH_RUNTIME_STATUS", "") not in {"running", "starting"}:
+                hints[-1] = "refresh"
+            self.command_input().placeholder = (
+                f"{VIEW_LABELS[self.active_view_name()]} | try: " + "  |  ".join(hints)
+            )
+
+        def update_sidebar_layout(self) -> None:
+            sidebar = self.query_one("#sidebar", Vertical)
+            if self.sidebar_visible:
+                sidebar.remove_class("hidden")
+                self.query_one("#sidebar-label", Static).update(
+                    Text(
+                        "Side Rail  |  Watch movement, tasks, and signals  |  Ctrl+N hide",
+                        no_wrap=True,
+                        overflow="ellipsis",
+                    )
+                )
+            else:
+                sidebar.add_class("hidden")
+
+        def _replace_option_list(self, widget_id: str, options: list[Option]) -> None:
+            option_list = self.query_one(widget_id, OptionList)
+            previous = option_list.highlighted
+            option_list.clear_options()
+            for option in options:
+                option_list.add_option(option)
+            if previous is not None and options:
+                option_list.highlighted = min(previous, len(options) - 1)
+
+        def update_sidebar(self) -> None:
+            state = self.last_state
+            watch_options = [WatchEntry(source) for source in build_feedback_sources(state)]
+            task_options = [TaskEntry(item) for item in tracked_task_items(state.task_file)[:80]]
+            signal_options = [
+                SignalEntry(item)
+                for item in recent_signal_items(state.views["signals"].path, limit=60)
+            ]
+            self._replace_option_list("#watch-list", watch_options)
+            self._replace_option_list("#task-list", task_options)
+            self._replace_option_list("#signal-list", signal_options)
 
         def resolve_script_path(self, script_name: str) -> Path:
             candidate = self.workspace / ".cursor" / "ralph-scripts" / script_name
@@ -1576,6 +2311,8 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 PaletteCommand("Show Signals", "show_signals", "signals warn rotate complete", "Switch to signal history"),
                 PaletteCommand("Show Errors", "show_errors", "errors failures", "Switch to error log"),
                 PaletteCommand("Show Console", "show_console", "console stdout stderr", "Switch to Ralph console output"),
+                PaletteCommand("Focus Command Bar", "focus_command_bar", "command omnibox", "Type a command or quick search"),
+                PaletteCommand("Toggle Side Rail", "toggle_sidebar", "sidebar rail navigation", "Show or hide the operator rail"),
                 PaletteCommand("Toggle Split View", "toggle_split", "split buddy side by side", "Show or hide a buddy pane"),
                 PaletteCommand("Cycle Buddy Pane", "cycle_companion", "buddy companion pin", "Swap the companion pane"),
                 PaletteCommand("Toggle Follow", "toggle_follow", "follow live tail", "Pause or resume live follow"),
@@ -1587,13 +2324,14 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 PaletteCommand("Previous Signal", "jump_previous_signal", "previous signal marker", "Jump to the previous Ralph signal"),
                 PaletteCommand("Refresh Dashboard", "refresh_now", "refresh reload", "Force an immediate refresh"),
                 PaletteCommand("Toggle Help", "toggle_help", "help guide", "Collapse or expand the help strip"),
+                PaletteCommand("Show Full Help", "show_help", "f1 help docs", "Open the detailed help modal"),
                 PaletteCommand("Stop Loop", "stop_loop", "stop terminate", "Stop the dashboard-launched Ralph loop"),
                 PaletteCommand("Quit Dashboard", "quit_dashboard", "quit exit close", "Close the dashboard"),
             ]
 
         def update_tab_labels(self) -> None:
             active_view = self.active_view_name()
-            tabbed_content = self.query_one(TabbedContent)
+            tabbed_content = self.query_one("#views", TabbedContent)
             self.unread_counts[active_view] = 0
             for view_name in VIEW_ORDER:
                 label = TAB_LABELS[view_name]
@@ -1707,8 +2445,125 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             self.set_palette_open(False)
             self.invoke_action(action_name)
 
+        def jump_to_task_line(self, raw_line: int) -> bool:
+            self.show_view("tasks", announce=False)
+            task_view = self.query_one("#tasks-view", FileView)
+            return task_view.jump_to_raw_line(raw_line)
+
+        def jump_to_signal_line(self, raw_line: int) -> bool:
+            self.show_view("signals", announce=False)
+            signal_view = self.query_one("#signals-view", FileView)
+            signal_view.set_filter_mode("all")
+            return signal_view.jump_to_raw_line(raw_line)
+
+        def focus_command_bar(self, seed: str = "") -> None:
+            if self.search_open:
+                self.set_search_open(False)
+            if self.palette_open:
+                self.set_palette_open(False)
+            command_input = self.command_input()
+            command_input.value = seed
+            command_input.focus()
+            self.set_note("Command bar focused. Enter a command or plain text to search the active pane.")
+
+        def apply_search_query(self, query: str) -> None:
+            if not query:
+                self.set_note("Search query was empty.")
+                return
+            matches = self.active_file_view().set_search_query(query, jump_to_first=True)
+            self.set_note(f"Search set on {VIEW_LABELS[self.active_view_name()].lower()} with {matches} matches.")
+
+        async def execute_command_intent(self, intent: CommandIntent) -> None:
+            if intent.kind == "noop":
+                self.set_note("Command bar cleared.")
+                return
+            if intent.kind == "help":
+                self.action_show_help()
+                return
+            if intent.kind == "refresh":
+                await self.action_refresh_now()
+                return
+            if intent.kind == "stop":
+                await self.action_stop_loop()
+                return
+            if intent.kind == "view":
+                self.show_view(intent.argument)
+                return
+            if intent.kind == "buddy" and intent.argument:
+                self.companion_view_name = intent.argument
+                if not self.split_mode:
+                    self.split_mode = True
+                self.update_split_layout()
+                self.set_note(f"Buddy pane switched to {VIEW_LABELS[intent.argument].lower()}.")
+                return
+            if intent.kind == "filter" and intent.argument:
+                mode_name = FILTER_LABELS[self.active_file_view().set_filter_mode(intent.argument)]
+                self.set_note(f"{VIEW_LABELS[self.active_view_name()]} filter set to {mode_name}.")
+                if self.split_mode:
+                    self.update_split_layout()
+                return
+            if intent.kind == "split":
+                target = intent.argument or "toggle"
+                if target == "toggle":
+                    self.action_toggle_split()
+                elif target == "on":
+                    if not self.split_mode:
+                        self.split_mode = True
+                        self.update_split_layout()
+                    self.set_note("Split view on.")
+                else:
+                    if self.split_mode:
+                        self.split_mode = False
+                        self.update_split_layout()
+                    self.set_note("Split view off.")
+                return
+            if intent.kind == "sidebar":
+                target = intent.argument or "toggle"
+                if target == "toggle":
+                    self.action_toggle_sidebar()
+                elif target == "on":
+                    self.sidebar_visible = True
+                    self.update_sidebar_layout()
+                    self.set_note("Side rail visible.")
+                else:
+                    self.sidebar_visible = False
+                    self.update_sidebar_layout()
+                    self.set_note("Side rail hidden.")
+                return
+            if intent.kind == "follow":
+                file_view = self.active_file_view()
+                if not file_view.follow_output:
+                    self.set_note(f"{VIEW_LABELS[self.active_view_name()]} does not use live follow.")
+                    return
+                target = intent.argument or "toggle"
+                if target == "toggle":
+                    enabled = file_view.toggle_follow()
+                else:
+                    enabled = target == "on"
+                    file_view.set_auto_follow(enabled)
+                    if enabled:
+                        file_view.scroll_to_latest()
+                self.set_note(
+                    f"{VIEW_LABELS[self.active_view_name()]} follow is now {'live' if enabled else 'paused'}."
+                )
+                return
+            if intent.kind == "hot":
+                telemetry = session_telemetry(self.last_state.session)
+                target = telemetry.hot_file or telemetry.thrash_path
+                if not target:
+                    self.set_note("No hot file or thrash path is available yet.")
+                    return
+                self.show_view("activity", announce=False)
+                self.apply_search_query(target)
+                self.set_note(f"Focused on hot path: {target}")
+                return
+            if intent.kind == "search":
+                self.apply_search_query(intent.argument)
+
         def update_cards(self) -> None:
             state = self.last_state
+            telemetry = session_telemetry(state.session)
+            feedback_sources = build_feedback_sources(state)
             mascot, mood, mood_color = mood_snapshot(state)
             freshness = (
                 f"STALE for {state.stale_seconds}s"
@@ -1755,10 +2610,16 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             progress_table.add_column(justify="right")
             progress_table.add_row(
                 f"Criteria  {state.done_count}/{state.total_count}",
-                render_progress_bar(state.done_count, state.total_count),
+                render_progress_bar(state.done_count, state.total_count, width=18),
             )
             progress_table.add_row("Remaining", str(state.remaining_count))
-            progress_table.add_row("Tokens", f"{state.token_count}/200000 ({state.token_pct}%)")
+            progress_table.add_row(
+                "Tokens",
+                (
+                    f"{render_progress_bar(state.token_count, TOKEN_BUDGET, width=18)} "
+                    f"{state.token_pct}%"
+                ),
+            )
             progress_table.add_row("Health", state.health_label)
             progress_table.add_row("Filter", FILTER_LABELS[self.active_file_view().current_filter_mode()])
             progress_table.add_row(
@@ -1766,15 +2627,82 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 state.next_task[:28] + ("..." if len(state.next_task) > 28 else ""),
             )
 
-            latest_signal = state.runtime["RALPH_RUNTIME_LAST_SIGNAL"]
-            signal_lines = Group(
-                Text(f"Signal: {latest_signal}", style="bold #90e0ef"),
-                Text("Trail: " + " > ".join(state.signal_timeline[-5:]), style="#ffd166"),
-                *[
-                    Text(line or " ", style="#f7f4ea", overflow="ellipsis")
-                    for line in (state.latest_signals[-3:] or ["No signals yet."])
-                ],
+            telemetry_table = Table.grid(expand=True)
+            telemetry_table.add_column(justify="left")
+            telemetry_table.add_column(justify="right")
+            telemetry_table.add_row(
+                "Reads",
+                f"{telemetry.read_calls} / {format_bytes(telemetry.bytes_read)}",
             )
+            telemetry_table.add_row(
+                "Writes",
+                f"{telemetry.write_calls} / {format_bytes(telemetry.bytes_written)}",
+            )
+            telemetry_table.add_row(
+                "Shell",
+                f"{telemetry.shell_calls} / {format_bytes(telemetry.shell_output_chars)}",
+            )
+            telemetry_table.add_row(
+                "Assistant",
+                f"{format_bytes(telemetry.assistant_chars)} / {format_count(telemetry.assistant_tokens)} tok",
+            )
+            telemetry_table.add_row(
+                "Tools",
+                f"{telemetry.tool_calls} total / {telemetry.work_write_calls} work writes",
+            )
+            telemetry_table.add_row(
+                "Large reads",
+                (
+                    f"{telemetry.large_reads} / rereads {telemetry.large_read_rereads}"
+                    + (" / thrash" if telemetry.large_read_thrash_hit else "")
+                ),
+            )
+            if telemetry.hot_file:
+                telemetry_table.add_row(
+                    "Hot file",
+                    clip_middle(
+                        f"{telemetry.hot_file} x{telemetry.hot_file_reads} "
+                        f"({format_bytes(telemetry.hot_file_bytes)})",
+                        width=34,
+                    ),
+                )
+            elif telemetry.thrash_path:
+                telemetry_table.add_row("Thrash path", clip_middle(telemetry.thrash_path, width=34))
+
+            token_rows = token_mix_rows(telemetry)
+            token_total = sum(value for _, value in token_rows)
+            token_table = Table.grid(expand=True)
+            token_table.add_column(justify="left")
+            token_table.add_column(justify="right")
+            if token_total <= 0:
+                token_table.add_row("Status", "Waiting for parser telemetry")
+            else:
+                for label, value in token_rows:
+                    if value <= 0:
+                        continue
+                    token_table.add_row(
+                        label,
+                        f"{render_progress_bar(value, token_total, width=14)} {format_count(value)}",
+                    )
+
+            feedback_table = Table(
+                expand=True,
+                box=None,
+                pad_edge=False,
+                show_header=True,
+                header_style="bold #ffd166",
+            )
+            feedback_table.add_column("Source", no_wrap=True, style="#8ecae6")
+            feedback_table.add_column("Pulse", no_wrap=True, style="#ffd166")
+            feedback_table.add_column("Age", no_wrap=True, style="#bde0fe")
+            feedback_table.add_column("Preview", overflow="ellipsis", style="#f7f4ea")
+            for source in feedback_sources:
+                feedback_table.add_row(
+                    source.label,
+                    source.pulse,
+                    format_age(source.age_seconds),
+                    source.preview,
+                )
 
             self.query_one("#hero-card", Static).update(
                 Panel(hero_lines, title="Mission Control", border_style=mood_color)
@@ -1782,17 +2710,23 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             self.query_one("#progress-card", Static).update(
                 Panel(progress_table, title="Progress", border_style="#f4a261")
             )
-            self.query_one("#signal-card", Static).update(
-                Panel(signal_lines, title="Signals", border_style="#e9c46a")
+            self.query_one("#telemetry-card", Static).update(
+                Panel(telemetry_table, title="Agent IO", border_style="#e9c46a")
+            )
+            self.query_one("#token-card", Static).update(
+                Panel(token_table, title="Token Mix", border_style="#90e0ef")
+            )
+            self.query_one("#feedback-card", Static).update(
+                Panel(feedback_table, title="Feedback Radar", border_style="#8ecae6")
             )
 
         def update_help_strip(self) -> None:
             if self.help_expanded:
                 message = (
                     "Keys: 1-6 views | tab/shift-tab or left/right switch | "
-                    "j/k scroll | g/G jump | f follow | v/V filter | / search | "
-                    "n/N matches | t/T tasks | [/] signals | s split | b/B buddy | "
-                    ": palette | r refresh | ? help | x stop | q quit"
+                    "j/k scroll | g/G jump | f follow | v/V filter | / or : command | "
+                    "ctrl+f search | n/N matches | t/T tasks | [/] signals | "
+                    "ctrl+n rail | s split | b/B buddy | ctrl+p palette | F1 help | x stop | q quit"
                 )
             else:
                 message = "Press ? to reopen the control guide."
@@ -1836,6 +2770,7 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 if self.split_mode
                 else "Split:off"
             )
+            rail_summary = "Rail:on" if self.sidebar_visible else "Rail:off"
             stale_summary = (
                 f"Stale:{state.stale_seconds}s"
                 if state.is_stale and state.stale_seconds is not None
@@ -1846,7 +2781,7 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 f"Mode: {state.runtime['RALPH_RUNTIME_MODE']}  |  "
                 f"Model: {resolved_model_label(state)}  |  "
                 f"Filter: {FILTER_LABELS[self.active_file_view().current_filter_mode()]}  |  "
-                f"{split_summary}  |  {stale_summary}  |  "
+                f"{split_summary}  |  {rail_summary}  |  {stale_summary}  |  "
                 f"{child_state}"
             )
             self.query_one("#status-strip", Static).update(
@@ -1938,9 +2873,12 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 self.emit_notifications(previous_state, state)
                 self.update_tab_labels()
                 self.update_cards()
+                self.update_command_bar()
                 self.update_help_strip()
                 self.update_timeline_strip()
                 self.update_celebration_strip()
+                self.update_sidebar_layout()
+                self.update_sidebar()
                 self.update_split_layout()
                 self.update_status_strip()
             finally:
@@ -1957,9 +2895,12 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             self.emit_notifications(previous_state, state, allow_toasts=False)
             self.update_tab_labels()
             self.update_cards()
+            self.update_command_bar()
             self.update_help_strip()
             self.update_timeline_strip()
             self.update_celebration_strip()
+            self.update_sidebar_layout()
+            self.update_sidebar()
             self.update_split_layout()
             self.update_status_strip()
 
@@ -2085,9 +3026,10 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 self.notify("Stopped the dashboard-launched Ralph loop.", title="Loop Stopped", timeout=3)
 
         def show_view(self, view_name: str, *, announce: bool = True) -> None:
-            self.query_one(TabbedContent).active = view_name
+            self.query_one("#views", TabbedContent).active = view_name
             self.unread_counts[view_name] = 0
             self.update_tab_labels()
+            self.update_command_bar()
             self.update_split_layout()
             if self.search_open:
                 search_input = self.search_input()
@@ -2097,9 +3039,12 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 self.set_note(f"Showing {VIEW_LABELS[view_name].lower()}.")
 
         def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
-            del event
+            if event.tabbed_content.id == "sidebar-tabs":
+                self.update_status_strip()
+                return
             self.unread_counts[self.active_view_name()] = 0
             self.update_tab_labels()
+            self.update_command_bar()
             self.update_split_layout()
             if self.search_open:
                 search_input = self.search_input()
@@ -2112,6 +3057,8 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
         def on_input_changed(self, event: Input.Changed) -> None:
             if event.input.id == "search-input" and self.search_open:
                 self.active_file_view().set_search_query(event.value)
+                return
+            if event.input.id == "command-input":
                 return
             if event.input.id == "palette-input" and self.palette_open:
                 self.palette_selected = 0
@@ -2126,6 +3073,10 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                     self.set_note("Search cleared.")
                 self.set_search_open(False)
                 return
+            if event.input.id == "command-input":
+                event.input.value = ""
+                asyncio.create_task(self.execute_command_intent(parse_command_bar_input(event.value)))
+                return
             if event.input.id == "palette-input":
                 self.run_palette_selection()
 
@@ -2138,6 +3089,31 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             elif event.key == "up":
                 self.move_palette_selection(-1)
                 event.stop()
+
+        def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+            if event.option_list.id == "watch-list":
+                event.stop()
+                assert isinstance(event.option, WatchEntry)
+                self.show_view(event.option.view_name)
+                return
+            if event.option_list.id == "task-list":
+                event.stop()
+                assert isinstance(event.option, TaskEntry)
+                jumped = self.jump_to_task_line(event.option.raw_line)
+                self.set_note(
+                    f"Jumped to task: {event.option.label_text}"
+                    if jumped
+                    else "Task is not visible in the main pane."
+                )
+                return
+            if event.option_list.id == "signal-list":
+                event.stop()
+                assert isinstance(event.option, SignalEntry)
+                jumped = self.jump_to_signal_line(event.option.raw_line)
+                self.set_note(
+                    f"Jumped to signal: {event.option.signal}" if jumped else "Signal is not visible in the main pane."
+                )
+                return
 
         def action_show_activity(self) -> None:
             self.show_view("activity")
@@ -2244,11 +3220,19 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             self.update_split_layout()
             self.set_note(f"Buddy pane switched to {VIEW_LABELS[self.current_companion_view()].lower()}.")
 
+        def action_focus_command_bar(self) -> None:
+            self.focus_command_bar()
+
         def action_open_search(self) -> None:
             self.set_search_open(True)
 
         def action_open_palette(self) -> None:
             self.set_palette_open(True)
+
+        def action_toggle_sidebar(self) -> None:
+            self.sidebar_visible = not self.sidebar_visible
+            self.update_sidebar_layout()
+            self.set_note("Side rail visible." if self.sidebar_visible else "Side rail hidden.")
 
         def action_cancel_overlay(self) -> None:
             if self.palette_open:
@@ -2258,6 +3242,15 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             if self.search_open:
                 self.set_search_open(False)
                 self.set_note("Search bar closed.")
+                return
+            command_input = self.command_input()
+            if self.focused is command_input:
+                if command_input.value:
+                    command_input.value = ""
+                    self.set_note("Command bar cleared.")
+                else:
+                    command_input.blur()
+                    self.set_note("Command bar unfocused.")
 
         def action_search_next(self) -> None:
             result = self.active_file_view().jump_to_search_result(backwards=False)
@@ -2307,6 +3300,9 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             self.help_expanded = not self.help_expanded
             self.update_help_strip()
             self.set_note("Help expanded." if self.help_expanded else "Help collapsed.")
+
+        def action_show_help(self) -> None:
+            self.push_screen(HelpModal())
 
         async def action_stop_loop(self) -> None:
             await self.stop_child_loop()

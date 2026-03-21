@@ -87,6 +87,17 @@ RALPH_SESSION_SHELL_CALLS=0
 RALPH_SESSION_LARGE_READS=0
 RALPH_SESSION_LARGE_READ_REREADS=0
 RALPH_SESSION_LARGE_READ_THRASH_HIT=0
+RALPH_SESSION_HOT_FILE=src/demo.ts
+RALPH_SESSION_HOT_FILE_READS=2
+RALPH_SESSION_HOT_FILE_BYTES=4096
+RALPH_SESSION_HOT_FILE_LINES=120
+RALPH_SESSION_THRASH_PATH=
+RALPH_SESSION_PROMPT_TOKENS=480
+RALPH_SESSION_READ_TOKENS=120
+RALPH_SESSION_WRITE_TOKENS=60
+RALPH_SESSION_ASSISTANT_TOKENS=90
+RALPH_SESSION_SHELL_TOKENS=10
+RALPH_SESSION_TOOL_OVERHEAD_TOKENS=12
 EOF
 
   printf '%s\n' "$dir"
@@ -547,6 +558,43 @@ assert stale_state.is_stale, stale_state
 PY
 }
 
+run_command_helper_case() {
+  local workspace
+  workspace="$(make_workspace)"
+
+  python3 - "$REPO_DIR/scripts/ralph-tui.py" "$workspace" <<'PY'
+import runpy
+import sys
+from pathlib import Path
+
+ns = runpy.run_path(sys.argv[1], run_name="ralph_tui_test")
+workspace = Path(sys.argv[2])
+
+assert ns["resolve_view_alias"]("task") == "tasks"
+assert ns["resolve_filter_alias"]("error") == "errors"
+
+intent = ns["parse_command_bar_input"]("signals")
+assert intent.kind == "view" and intent.argument == "signals", intent
+
+intent = ns["parse_command_bar_input"]("filter interesting")
+assert intent.kind == "filter" and intent.argument == "interesting", intent
+
+intent = ns["parse_command_bar_input"]("/warn")
+assert intent.kind == "search" and intent.argument == "warn", intent
+
+intent = ns["parse_command_bar_input"]("hot")
+assert intent.kind == "hot", intent
+
+tasks = ns["tracked_task_items"](workspace / "RALPH_TASK.md")
+assert len(tasks) == 3, tasks
+assert tasks[1].label == "Dashboard shows current task state", tasks[1]
+assert not tasks[1].done, tasks[1]
+
+signals = ns["recent_signal_items"](workspace / ".ralph/signals.log")
+assert signals[-1].signal == "WARN", signals
+PY
+}
+
 main() {
   local workspace snapshot_file
   workspace="$(make_workspace)"
@@ -559,6 +607,10 @@ main() {
   assert_contains "$snapshot_file" "Timeline:"
   assert_contains "$snapshot_file" "Cursor: session cursor-session-123 | req request-456 | perm default"
   assert_contains "$snapshot_file" "Model: test-model"
+  assert_contains "$snapshot_file" "Telemetry: reads 1 (0B)  writes 0 (0B)  shell 0  tools 0"
+  assert_contains "$snapshot_file" "Hot file: src/demo.ts x2 (4.0KB, 120 lines)"
+  assert_contains "$snapshot_file" "Sources:"
+  assert_contains "$snapshot_file" "- Signals: WARN"
 
   if python3 - <<'PY' >/dev/null 2>&1
 import textual
@@ -630,6 +682,7 @@ PY
   run_task_scaffolding_warning_case
   run_signal_timeline_case
   run_dashboard_state_logic_case
+  run_command_helper_case
 
   echo "dashboard smoke test passed"
 }

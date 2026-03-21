@@ -225,6 +225,12 @@ Ralph will:
 ```
 
 This opens the Textual dashboard with:
+- a dense cockpit header tuned for wide laptop terminals
+- task progress bars, token mix, and agent I/O telemetry sourced from `.ralph/.last-session.env`
+- a feedback radar that shows the latest pulse from activity, progress, tasks, signals, errors, and console at the same time
+- automatic split view on roomy terminals so the main pane and a live buddy pane stay visible together
+- a Frogmouth-style command bar for quick navigation and pane search
+- a side rail for watch sources, checklist items, and recent signal jumps
 - `1` `activity.log`
 - `2` `progress.md`
 - `3` `RALPH_TASK.md` / `ralph-tasks.md`
@@ -232,6 +238,9 @@ This opens the Textual dashboard with:
 - `5` `errors.log`
 - `6` dashboard console log
 - `tab` / `shift+tab` to cycle panes
+- `/` or `:` to focus the command bar
+- `ctrl+n` to toggle the side rail
+- `F1` for the full operator help screen
 - `up/down`, `j/k`, `pgup/pgdn`, `g/G` to scroll
 - `?` to toggle the inline help
 - `x` to stop a dashboard-launched Ralph loop
