@@ -42,6 +42,7 @@ SHELL_OUTPUT_CHARS=0
 PROMPT_CHARS=0
 TOOL_CALLS=0
 WARN_SENT=0
+SESSION_START_SENT=0
 READ_CALLS=0
 WRITE_CALLS=0
 WORK_WRITE_CALLS=0
@@ -505,6 +506,13 @@ write_session_metrics() {
   mv "$tmp_file" "$summary_file"
 }
 
+log_session_result() {
+  local duration_ms="${1:-0}"
+  local tokens
+  tokens=$(calc_tokens)
+  log_activity "SESSION END: ${duration_ms}ms, ~$tokens tokens used"
+}
+
 process_raw_line() {
   local line="$1"
   local trimmed="${line//$'\r'/}"
@@ -538,6 +546,7 @@ process_line() {
   case "$type" in
     "system")
       if [[ "$subtype" == "init" ]]; then
+        local requested_model="${RALPH_MODEL_RUNTIME:-unknown}"
         local model=$(echo "$line" | jq -r '.model // "unknown"' 2>/dev/null) || model="unknown"
         local session_id=$(echo "$line" | jq -r '.session_id // .sessionId // .chatId // empty' 2>/dev/null) || session_id=""
         local permission_mode=$(echo "$line" | jq -r '.permissionMode // .permission_mode // empty' 2>/dev/null) || permission_mode=""
@@ -557,6 +566,31 @@ process_line() {
           session_msg="$session_msg permission=$CURSOR_PERMISSION_MODE"
         fi
         log_activity "$session_msg"
+        if [[ $SESSION_START_SENT -eq 0 ]]; then
+          local signal_detail=""
+          if [[ -n "$CURSOR_SESSION_ID" ]]; then
+            signal_detail="session=$CURSOR_SESSION_ID"
+          fi
+          if [[ -n "$CURSOR_PERMISSION_MODE" ]]; then
+            if [[ -n "$signal_detail" ]]; then
+              signal_detail="$signal_detail permission=$CURSOR_PERMISSION_MODE"
+            else
+              signal_detail="permission=$CURSOR_PERMISSION_MODE"
+            fi
+          fi
+          if [[ -n "$requested_model" ]] && [[ "$requested_model" != "unknown" ]] && [[ "$requested_model" != "$model" ]]; then
+            if [[ -n "$signal_detail" ]]; then
+              signal_detail="$signal_detail requested_model=$requested_model"
+            else
+              signal_detail="requested_model=$requested_model"
+            fi
+          fi
+          log_signal_event "SESSION_START" "$signal_detail"
+          SESSION_START_SENT=1
+        fi
+        if [[ -n "$model" ]] && [[ "$model" != "unknown" ]] && [[ "$model" != "$requested_model" ]]; then
+          echo "Cursor resolved model: $model" >&2
+        fi
         write_session_metrics
       fi
       ;;
@@ -574,7 +608,7 @@ process_line() {
         log_error "⚠️ RETRYABLE: Error may be transient (rate limit/network)"
         emit_signal_once "DEFER"
       else
-        emit_signal_once "GUTTER" "❌ API ERROR: non-retryable failure" "🚨 NON-RETRYABLE: Error requires attention"
+        emit_signal_once "ABORT" "❌ API ERROR: non-retryable failure" "🚨 NON-RETRYABLE: Error requires attention"
       fi
       ;;
       
@@ -603,6 +637,7 @@ process_line() {
     "result")
       local session_id=$(echo "$line" | jq -r '.session_id // .sessionId // .chatId // empty' 2>/dev/null) || session_id=""
       local request_id=$(echo "$line" | jq -r '.request_id // .requestId // empty' 2>/dev/null) || request_id=""
+      local duration=$(echo "$line" | jq -r '.duration_ms // 0' 2>/dev/null) || duration=0
       if [[ -n "$session_id" ]]; then
         CURSOR_SESSION_ID="$session_id"
       fi
@@ -610,6 +645,7 @@ process_line() {
         CURSOR_REQUEST_ID="$request_id"
       fi
       write_session_metrics
+      log_session_result "$duration"
       ;;
       
     "tool_call")
@@ -693,11 +729,6 @@ process_line() {
       fi
       ;;
       
-    "result")
-      local duration=$(echo "$line" | jq -r '.duration_ms // 0' 2>/dev/null) || duration=0
-      local tokens=$(calc_tokens)
-      log_activity "SESSION END: ${duration}ms, ~$tokens tokens used"
-      ;;
   esac
 }
 

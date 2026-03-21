@@ -219,6 +219,36 @@ initialize_session_metrics() {
   mv "$tmp_file" "$summary_file"
 }
 
+resolve_runtime_model() {
+  local workspace="${1:-.}"
+  local iteration="${2:-}"
+  local fallback="${3:-${MODEL:-unknown}}"
+
+  load_last_session_metrics "$workspace"
+  if [[ -n "${RALPH_SESSION_MODEL:-}" ]] && [[ -n "$iteration" ]] && [[ "${RALPH_SESSION_ITERATION:-}" == "$iteration" ]]; then
+    printf '%s\n' "$RALPH_SESSION_MODEL"
+    return
+  fi
+
+  if [[ -n "$fallback" ]]; then
+    printf '%s\n' "$fallback"
+  else
+    printf '%s\n' "unknown"
+  fi
+}
+
+format_requested_model_label() {
+  local model="${1:-${MODEL:-unknown}}"
+
+  if [[ "$model" == "auto" ]]; then
+    printf '%s\n' "auto (Cursor will resolve)"
+  elif [[ -n "$model" ]]; then
+    printf '%s\n' "$model"
+  else
+    printf '%s\n' "unknown"
+  fi
+}
+
 # =============================================================================
 # LOGGING
 # =============================================================================
@@ -268,16 +298,18 @@ write_runtime_state() {
   local mode="${7:-sequential}"
   local agent_pid="${8:-}"
   local state_file="$workspace/.ralph/runtime.env"
+  local resolved_model
   local tmp_file
 
   mkdir -p "$workspace/.ralph"
+  resolved_model=$(resolve_runtime_model "$workspace" "$iteration" "$model")
   tmp_file=$(mktemp)
 
   {
     echo "# Ralph runtime state"
     printf 'RALPH_RUNTIME_STATUS=%q\n' "$status"
     printf 'RALPH_RUNTIME_ITERATION=%q\n' "$iteration"
-    printf 'RALPH_RUNTIME_MODEL=%q\n' "$model"
+    printf 'RALPH_RUNTIME_MODEL=%q\n' "$resolved_model"
     printf 'RALPH_RUNTIME_LAST_SIGNAL=%q\n' "$last_signal"
     printf 'RALPH_RUNTIME_LAST_EVENT=%q\n' "$last_event"
     printf 'RALPH_RUNTIME_MODE=%q\n' "$mode"
@@ -286,6 +318,74 @@ write_runtime_state() {
   } > "$tmp_file"
 
   mv "$tmp_file" "$state_file"
+}
+
+stop_workspace_runtime() {
+  local workspace="${1:-.}"
+  local reason="${2:-Stopped Ralph workspace}"
+  local source="${3:-dashboard}"
+  local runtime_file="$workspace/.ralph/runtime.env"
+  local lock_dir="$workspace/$SEQUENTIAL_LOCK_DIR"
+  local fifo="$workspace/.ralph/.parser_fifo"
+  local runtime_status="idle"
+  local runtime_iteration="0"
+  local runtime_model="${MODEL:-unknown}"
+  local runtime_mode="sequential"
+  local runtime_agent_pid=""
+  local lock_pid=""
+  local acted=1
+  local seen_pids=""
+  local pid=""
+
+  if [[ -f "$runtime_file" ]]; then
+    # shellcheck disable=SC1090
+    source "$runtime_file"
+    runtime_status="${RALPH_RUNTIME_STATUS:-idle}"
+    runtime_iteration="${RALPH_RUNTIME_ITERATION:-0}"
+    runtime_model="${RALPH_RUNTIME_MODEL:-${MODEL:-unknown}}"
+    runtime_mode="${RALPH_RUNTIME_MODE:-sequential}"
+    runtime_agent_pid="${RALPH_RUNTIME_AGENT_PID:-}"
+  fi
+
+  if [[ -f "$lock_dir/pid" ]]; then
+    lock_pid=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
+  fi
+
+  for pid in "$runtime_agent_pid" "$lock_pid"; do
+    [[ -n "$pid" ]] || continue
+    case " $seen_pids " in
+      *" $pid "*) continue ;;
+    esac
+    seen_pids="$seen_pids $pid"
+    if kill -0 "$pid" 2>/dev/null; then
+      stop_process_tree "$pid"
+      acted=0
+    fi
+  done
+
+  if [[ -p "$fifo" ]] || [[ -e "$fifo" ]]; then
+    rm -f "$fifo" 2>/dev/null || true
+    acted=0
+  fi
+
+  if [[ -d "$lock_dir" ]]; then
+    rm -rf "$lock_dir" 2>/dev/null || true
+    acted=0
+  fi
+
+  case "$runtime_status" in
+    running|starting|rotating|gutter|deferred|loop|looping)
+      acted=0
+      ;;
+  esac
+
+  if [[ $acted -eq 0 ]]; then
+    append_signal_event "$workspace" "STOPPED" "$reason" "$source" "$runtime_iteration"
+    write_runtime_state "$workspace" "stopped" "$runtime_iteration" "$runtime_model" "STOPPED" "$reason" "$runtime_mode" ""
+    return 0
+  fi
+
+  return 1
 }
 
 # Append a durable signal/event record for the dashboard
@@ -1373,7 +1473,7 @@ run_iteration() {
   local fifo="$workspace/.ralph/.parser_fifo"
   
   write_runtime_state "$workspace" "running" "$iteration" "$MODEL" "NONE" "Session $iteration starting" "sequential" ""
-  append_signal_event "$workspace" "SESSION_START" "model=$MODEL" "loop" "$iteration"
+  append_signal_event "$workspace" "SESSION_REQUESTED" "model_request=$MODEL" "loop" "$iteration"
   
   # Create named pipe for parser signals
   rm -f "$fifo"
@@ -1386,12 +1486,12 @@ run_iteration() {
   echo "═══════════════════════════════════════════════════════════════════" >&2
   echo "" >&2
   echo "Workspace: $workspace" >&2
-  echo "Model:     $MODEL" >&2
+  echo "Model:     $(format_requested_model_label "$MODEL")" >&2
   echo "Monitor:   tail -f $workspace/.ralph/activity.log" >&2
   echo "" >&2
   
   # Log session start to progress.md
-  log_progress "$workspace" "**Session $iteration started** (model: $MODEL)"
+  log_progress "$workspace" "**Session $iteration started** (model request: $(format_requested_model_label "$MODEL"))"
   
   # Build cursor-agent command
   local -a agent_cmd
@@ -1460,6 +1560,14 @@ run_iteration() {
         write_runtime_state "$workspace" "deferred" "$iteration" "$MODEL" "DEFER" "Transient error deferred" "sequential" "$agent_pid"
         signal="DEFER"
         # Stop the agent, will retry with backoff
+        stop_process_tree "$agent_pid"
+        break
+        ;;
+      "ABORT")
+        printf "\r\033[K" >&2  # Clear spinner line
+        echo "❌ Non-retryable agent failure detected - stopping this iteration..." >&2
+        write_runtime_state "$workspace" "error" "$iteration" "$MODEL" "ABORT" "Non-retryable agent failure" "sequential" "$agent_pid"
+        signal="ABORT"
         stop_process_tree "$agent_pid"
         break
         ;;
@@ -1849,7 +1957,7 @@ show_task_summary() {
   remaining=$((total_criteria - done_criteria))
   
   echo "Progress: $done_criteria / $total_criteria criteria complete ($remaining remaining)"
-  echo "Model:    $MODEL"
+  echo "Model:    $(format_requested_model_label "$MODEL")"
   echo ""
   
   # Return remaining count for caller to check

@@ -137,6 +137,7 @@ SCRIPTS=(
   "ralph-setup.sh"
   "ralph-loop.sh"
   "ralph-once.sh"
+  "ralph-stop.sh"
   "ralph-parallel.sh"
   "ralph-tui.py"
   "stream-parser.sh"

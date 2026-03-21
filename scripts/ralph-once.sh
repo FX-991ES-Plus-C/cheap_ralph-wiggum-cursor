@@ -116,7 +116,7 @@ main() {
   init_ralph_dir "$WORKSPACE"
   
   echo "Workspace: $WORKSPACE"
-  echo "Model:     $MODEL"
+  echo "Model:     $(format_requested_model_label "$MODEL")"
   echo ""
   
   # Show task summary
@@ -174,6 +174,49 @@ main() {
   # Check result
   local task_status
   task_status=$(check_task_complete "$WORKSPACE")
+  local final_status="idle"
+  local final_signal="${signal:-NONE}"
+  local final_event="Single iteration finished"
+
+  case "$signal" in
+    "COMPLETE")
+      if [[ "$task_status" == "COMPLETE" ]]; then
+        final_status="complete"
+        final_event="All criteria satisfied in single iteration"
+      else
+        final_status="idle"
+        final_event="Criteria remain after agent completion signal"
+      fi
+      ;;
+    "GUTTER")
+      final_status="gutter"
+      final_event="Agent got stuck during single iteration"
+      ;;
+    "ROTATE")
+      final_status="idle"
+      final_event="Context rotation triggered; review before rerun"
+      ;;
+    "DEFER")
+      final_status="idle"
+      final_event="Transient failure deferred; rerun to retry"
+      ;;
+    "ABORT")
+      final_status="error"
+      final_event="Agent launch/runtime failure"
+      ;;
+    *)
+      if [[ "$task_status" == "COMPLETE" ]]; then
+        final_status="complete"
+        final_signal="COMPLETE"
+        final_event="All criteria satisfied in single iteration"
+      else
+        final_status="idle"
+        final_signal="NONE"
+        final_event="Single iteration finished with criteria remaining"
+      fi
+      ;;
+  esac
+  write_runtime_state "$WORKSPACE" "$final_status" "1" "$MODEL" "$final_signal" "$final_event" "once" ""
   
   echo ""
   echo "═══════════════════════════════════════════════════════════════════"
@@ -205,6 +248,16 @@ main() {
       echo ""
       echo "The agent used a lot of context. This is normal for complex tasks."
       echo "Review the progress and run again or proceed to full loop."
+      ;;
+    "DEFER")
+      echo "⏸️  A transient error interrupted the iteration."
+      echo ""
+      echo "Review .ralph/errors.log, then rerun when the dependency or rate limit clears."
+      ;;
+    "ABORT")
+      echo "❌ Ralph hit a non-retryable agent failure."
+      echo ""
+      echo "Review .ralph/errors.log and .ralph/activity.log before rerunning."
       ;;
     *)
       if [[ "$task_status" == "COMPLETE" ]]; then

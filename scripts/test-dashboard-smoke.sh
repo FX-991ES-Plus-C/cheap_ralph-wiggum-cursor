@@ -52,14 +52,14 @@ EOF
   cat > "$dir/.ralph/signals.log" <<'EOF'
 # Signal Log
 
-[2026-03-19 12:00:00] source=parser iteration=1 signal=WARN model=test | Approaching token limit
+[2026-03-19 12:00:00] source=parser iteration=1 signal=WARN model=test-model | Approaching token limit
 EOF
 
   cat > "$dir/.ralph/runtime.env" <<'EOF'
 # Ralph runtime state
 RALPH_RUNTIME_STATUS=running
 RALPH_RUNTIME_ITERATION=1
-RALPH_RUNTIME_MODEL=test-model
+RALPH_RUNTIME_MODEL=auto
 RALPH_RUNTIME_LAST_SIGNAL=WARN
 RALPH_RUNTIME_LAST_EVENT=Context\ warning\ issued
 RALPH_RUNTIME_MODE=loop
@@ -115,6 +115,63 @@ run_parser_case() {
   assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_SIGNAL=${expected_signal}"
 }
 
+run_stop_helper_case() {
+  local workspace worker_pid child_pid lock_dir
+  workspace="$(make_workspace)"
+  lock_dir="$workspace/.ralph/locks/sequential.lock"
+  mkdir -p "$lock_dir"
+
+  cat > "$workspace/worker.sh" <<'EOF'
+#!/bin/bash
+sleep 60 &
+child=$!
+wait "$child"
+EOF
+  chmod +x "$workspace/worker.sh"
+
+  "$workspace/worker.sh" &
+  worker_pid=$!
+  sleep 0.2
+  child_pid="$(pgrep -P "$worker_pid" 2>/dev/null | awk 'NR==1 {print $1}')"
+
+  cat > "$workspace/.ralph/runtime.env" <<EOF
+# Ralph runtime state
+RALPH_RUNTIME_STATUS=running
+RALPH_RUNTIME_ITERATION=1
+RALPH_RUNTIME_MODEL=test-model
+RALPH_RUNTIME_LAST_SIGNAL=NONE
+RALPH_RUNTIME_LAST_EVENT=Session\ running
+RALPH_RUNTIME_MODE=loop
+RALPH_RUNTIME_AGENT_PID=$worker_pid
+RALPH_RUNTIME_UPDATED_AT=2026-03-19\ 12:00:00\ EDT
+EOF
+
+  printf '%s\n' "$worker_pid" > "$lock_dir/pid"
+  date -u '+%Y-%m-%dT%H:%M:%SZ' > "$lock_dir/created_at"
+  printf '%s\n' "$workspace" > "$lock_dir/cwd"
+
+  bash "$REPO_DIR/scripts/ralph-stop.sh" "$workspace" "Stopped from smoke test"
+
+  sleep 0.2
+  if kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Assertion failed: stop helper left worker process running" >&2
+    exit 1
+  fi
+  if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
+    echo "Assertion failed: stop helper left child process running" >&2
+    exit 1
+  fi
+  wait "$worker_pid" 2>/dev/null || true
+  if [[ -d "$lock_dir" ]]; then
+    echo "Assertion failed: stop helper left sequential lock in place" >&2
+    exit 1
+  fi
+
+  assert_contains "$workspace/.ralph/runtime.env" "RALPH_RUNTIME_STATUS=stopped"
+  assert_contains "$workspace/.ralph/runtime.env" "RALPH_RUNTIME_LAST_SIGNAL=STOPPED"
+  assert_contains "$workspace/.ralph/signals.log" "signal=STOPPED"
+}
+
 run_auto_model_case() {
   local workspace fakebin signal
   workspace="$(make_workspace)"
@@ -140,7 +197,7 @@ EOF
     init_ralph_dir "$workspace"
     signal="$(run_iteration "$workspace" 1 "$REPO_DIR/scripts")"
     [[ "$signal" == "COMPLETE" ]]
-  )
+  ) 2>"$workspace/run.stderr"
 
   if grep -qx -- '--model' "$workspace/agent-args.txt"; then
     echo "Assertion failed: MODEL=auto should not pass --model to cursor-agent" >&2
@@ -153,6 +210,42 @@ EOF
   assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_ID=cursor-session-auto"
   assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_REQUEST_ID=request-auto-123"
   assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_PERMISSION_MODE=default"
+  assert_contains "$workspace/.ralph/runtime.env" "RALPH_RUNTIME_MODEL=cursor-default"
+  assert_contains "$workspace/.ralph/signals.log" "signal=SESSION_REQUESTED | model_request=auto"
+  assert_contains "$workspace/.ralph/signals.log" "signal=SESSION_START model=cursor-default | session=cursor-session-auto permission=default requested_model=auto"
+  assert_contains "$workspace/.ralph/activity.log" "SESSION END: 0ms"
+  assert_contains "$workspace/run.stderr" "Model:     auto (Cursor will resolve)"
+  assert_contains "$workspace/run.stderr" "Cursor resolved model: cursor-default"
+}
+
+run_live_abort_case() {
+  local workspace fakebin signal
+  workspace="$(make_workspace)"
+  fakebin="$workspace/fakebin"
+  mkdir -p "$fakebin"
+
+  cat > "$fakebin/cursor-agent" <<'EOF'
+#!/bin/bash
+printf '%s\n' '{"type":"system","subtype":"init","model":"cursor-default","session_id":"cursor-session-abort","permissionMode":"default"}'
+printf '%s\n' '{"type":"error","error":{"message":"Permission denied for model"}}'
+exit 0
+EOF
+  chmod +x "$fakebin/cursor-agent"
+
+  (
+    export PATH="$fakebin:$PATH"
+    export MODEL=auto
+    export SCRIPT_DIR="$REPO_DIR/scripts"
+    # shellcheck disable=SC1090
+    source "$REPO_DIR/scripts/ralph-common.sh"
+    init_ralph_dir "$workspace"
+    signal="$(run_iteration "$workspace" 1 "$REPO_DIR/scripts")"
+    [[ "$signal" == "ABORT" ]]
+  ) >/dev/null 2>"$workspace/run.stderr"
+
+  assert_contains "$workspace/.ralph/runtime.env" "RALPH_RUNTIME_STATUS=error"
+  assert_contains "$workspace/.ralph/runtime.env" "RALPH_RUNTIME_LAST_SIGNAL=ABORT"
+  assert_contains "$workspace/.ralph/signals.log" "signal=ABORT"
 }
 
 run_signal_timeline_case() {
@@ -162,7 +255,8 @@ run_signal_timeline_case() {
   cat > "$workspace/.ralph/signals.log" <<'EOF'
 # Signal Log
 
-[2026-03-19 12:00:00] source=loop iteration=1 signal=SESSION_START | model=test
+[2026-03-19 12:00:00] source=loop iteration=1 signal=SESSION_REQUESTED | model_request=test
+[2026-03-19 12:00:00] source=parser iteration=1 signal=SESSION_START model=test | session=cursor-session-123 permission=default
 [2026-03-19 12:00:01] source=loop iteration=1 signal=LOOP_START | max_iterations=5
 [2026-03-19 12:00:02] source=loop iteration=1 signal=THRASH | repeated rotate-without-progress
 [2026-03-19 12:00:03] source=loop iteration=1 signal=ABORT | Agent launch/runtime failure
@@ -182,7 +276,7 @@ assert ns["signal_from_line"](
 assert ns["signal_from_line"](
     "[2026-03-19 12:00:01] source=loop iteration=1 signal=LOOP_START | max_iterations=5"
 ) == "LOOP_START"
-assert state.signal_timeline[-4:] == ["SESSION_START", "LOOP_START", "THRASH", "ABORT"], state.signal_timeline
+assert state.signal_timeline[-5:] == ["SESSION_REQUESTED", "SESSION_START", "LOOP_START", "THRASH", "ABORT"], state.signal_timeline
 assert state.latest_signals[-1].endswith("Agent launch/runtime failure"), state.latest_signals
 assert ns["cursor_session_summary"](state) == "session cursor-session-123 | req request-456 | perm default"
 PY
@@ -203,6 +297,51 @@ run_parser_session_metadata_case() {
   assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_MODEL=Cursor\\ Model\\ With\\ Spaces"
 }
 
+run_dashboard_state_logic_case() {
+  local fresh_workspace complete_workspace stale_workspace
+  fresh_workspace="$(make_workspace)"
+  complete_workspace="$(make_workspace)"
+  stale_workspace="$(make_workspace)"
+
+  cat > "$complete_workspace/.ralph/runtime.env" <<'EOF'
+# Ralph runtime state
+RALPH_RUNTIME_STATUS=running
+RALPH_RUNTIME_ITERATION=1
+RALPH_RUNTIME_MODEL=test-model
+RALPH_RUNTIME_LAST_SIGNAL=COMPLETE
+RALPH_RUNTIME_LAST_EVENT=Criteria\ remain\ after\ agent\ completion\ signal
+RALPH_RUNTIME_MODE=loop
+RALPH_RUNTIME_AGENT_PID=12345
+RALPH_RUNTIME_UPDATED_AT=2026-03-19\ 12:00:00\ EDT
+EOF
+
+  python3 - "$REPO_DIR/scripts/ralph-tui.py" "$fresh_workspace" "$complete_workspace" "$stale_workspace" <<'PY'
+import os
+import runpy
+import sys
+from pathlib import Path
+
+ns = runpy.run_path(sys.argv[1], run_name="ralph_tui_test")
+fresh_workspace = Path(sys.argv[2])
+complete_workspace = Path(sys.argv[3])
+stale_workspace = Path(sys.argv[4])
+
+fresh_state = ns["load_dashboard_state"](fresh_workspace)
+assert not fresh_state.is_stale, fresh_state
+
+complete_state = ns["load_dashboard_state"](complete_workspace)
+assert not complete_state.is_complete, complete_state
+
+old_epoch = 946684800
+for rel_path in (".ralph/activity.log", ".ralph/.last-session.env", ".ralph/signals.log"):
+    path = stale_workspace / rel_path
+    os.utime(path, (old_epoch, old_epoch))
+
+stale_state = ns["load_dashboard_state"](stale_workspace)
+assert stale_state.is_stale, stale_state
+PY
+}
+
 main() {
   local workspace snapshot_file
   workspace="$(make_workspace)"
@@ -214,6 +353,7 @@ main() {
   assert_contains "$snapshot_file" "Dashboard shows current task state"
   assert_contains "$snapshot_file" "Timeline:"
   assert_contains "$snapshot_file" "Cursor: session cursor-session-123 | req request-456 | perm default"
+  assert_contains "$snapshot_file" "Model: test-model"
 
   if python3 - <<'PY' >/dev/null 2>&1
 import textual
@@ -243,6 +383,11 @@ PY
     "ABORT" \
     'Cannot use this model: auto.'
 
+  run_parser_case \
+    "structured_abort" \
+    "ABORT" \
+    '{"type":"error","error":{"message":"Permission denied for model"}}'
+
   local rotate_workspace
   rotate_workspace="$(make_workspace)"
   printf '%s\n' \
@@ -271,8 +416,11 @@ PY
   assert_contains "$gutter_rotate_workspace/.ralph/.last-session.env" "RALPH_SESSION_SIGNAL=ROTATE"
 
   run_auto_model_case
+  run_live_abort_case
+  run_stop_helper_case
   run_parser_session_metadata_case
   run_signal_timeline_case
+  run_dashboard_state_logic_case
 
   echo "dashboard smoke test passed"
 }

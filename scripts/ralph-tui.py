@@ -49,6 +49,7 @@ SIGNAL_LINE_PATTERN = re.compile(r"\bsignal=([A-Za-z0-9_:-]+)")
 RALPH_TAG_PATTERN = re.compile(r"<ralph>\s*([A-Za-z0-9_:-]+)\s*</ralph>", re.IGNORECASE)
 KNOWN_SIGNAL_MARKERS = (
     "MAX_ITERATIONS",
+    "SESSION_REQUESTED",
     "SESSION_START",
     "LOOP_COMPLETE",
     "LOOP_START",
@@ -69,6 +70,7 @@ SIGNAL_STYLES = {
     "ABORT": "bold #e76f51",
     "THRASH": "bold #e76f51",
     "MAX_ITERATIONS": "bold #e76f51",
+    "SESSION_REQUESTED": "bold #8ecae6",
     "SESSION_START": "bold #8ecae6",
     "LOOP_START": "bold #8ecae6",
     "LOOP_COMPLETE": "bold #2a9d8f",
@@ -247,6 +249,15 @@ def current_session_metadata(state: DashboardState) -> dict[str, str]:
     return state.session
 
 
+def resolved_model_label(state: DashboardState) -> str:
+    session = current_session_metadata(state)
+    session_model = session.get("RALPH_SESSION_MODEL", "").strip()
+    if session_model:
+        return session_model
+    runtime_model = state.runtime.get("RALPH_RUNTIME_MODEL", "").strip()
+    return runtime_model or "unknown"
+
+
 def shorten_identifier(raw: str, width: int = 12) -> str:
     cleaned = raw.strip()
     if len(cleaned) <= width:
@@ -373,6 +384,15 @@ def parse_runtime_timestamp(raw: str) -> datetime | None:
         return None
 
 
+def file_timestamp(path: Path) -> datetime | None:
+    if not path.exists():
+        return None
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime)
+    except OSError:
+        return None
+
+
 def signal_from_line(line: str) -> str | None:
     upper_line = line.upper()
     if match := SIGNAL_LINE_PATTERN.search(line):
@@ -461,15 +481,18 @@ def mood_snapshot(state: DashboardState) -> tuple[str, str, str]:
     return "\\o/", "turbo wiggle", "#ffd166"
 
 
-def staleness_snapshot(runtime: dict[str, str]) -> tuple[int | None, bool]:
+def staleness_snapshot(runtime: dict[str, str], heartbeat_paths: list[Path]) -> tuple[int | None, bool]:
     status = runtime.get("RALPH_RUNTIME_STATUS", "").lower()
-    if status not in {"running", "loop", "looping"}:
+    if status not in {"running", "starting", "rotating", "gutter", "loop", "looping"}:
         return None, False
 
-    updated_at = parse_runtime_timestamp(runtime.get("RALPH_RUNTIME_UPDATED_AT", ""))
-    if updated_at is None:
+    timestamps = [parse_runtime_timestamp(runtime.get("RALPH_RUNTIME_UPDATED_AT", ""))]
+    timestamps.extend(file_timestamp(path) for path in heartbeat_paths)
+    fresh_candidates = [timestamp for timestamp in timestamps if timestamp is not None]
+    if not fresh_candidates:
         return None, False
 
+    updated_at = max(fresh_candidates)
     age_seconds = max(int((datetime.now() - updated_at).total_seconds()), 0)
     return age_seconds, age_seconds >= STALE_AFTER_SECONDS
 
@@ -508,13 +531,16 @@ def load_dashboard_state(workspace: Path) -> DashboardState:
     for key, value in runtime_defaults.items():
         runtime.setdefault(key, value)
 
-    stale_seconds, is_stale = staleness_snapshot(runtime)
-    last_signal = runtime["RALPH_RUNTIME_LAST_SIGNAL"].upper()
-    is_complete = last_signal == "COMPLETE" or runtime["RALPH_RUNTIME_STATUS"].lower() in {
-        "complete",
-        "completed",
-        "done",
-    }
+    stale_seconds, is_stale = staleness_snapshot(
+        runtime,
+        [
+            ralph_dir / "activity.log",
+            ralph_dir / ".last-session.env",
+            ralph_dir / "signals.log",
+        ],
+    )
+    status_complete = runtime["RALPH_RUNTIME_STATUS"].lower() in {"complete", "completed", "done"}
+    is_complete = status_complete and (total_count == 0 or remaining_count == 0)
 
     return DashboardState(
         workspace=workspace,
@@ -630,7 +656,7 @@ def render_snapshot(state: DashboardState) -> str:
             f"{state.runtime['RALPH_RUNTIME_STATUS']}  "
             f"Iteration: {state.runtime['RALPH_RUNTIME_ITERATION']}  "
             f"Mode: {state.runtime['RALPH_RUNTIME_MODE']}  "
-            f"Model: {state.runtime['RALPH_RUNTIME_MODEL']}"
+            f"Model: {resolved_model_label(state)}"
         ),
         f"Cursor: {cursor_session_summary(state)}",
         (
@@ -1536,6 +1562,12 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                     return candidate
             return self.companion_view_name
 
+        def resolve_script_path(self, script_name: str) -> Path:
+            candidate = self.workspace / ".cursor" / "ralph-scripts" / script_name
+            if candidate.exists():
+                return candidate
+            return Path(__file__).resolve().parent / script_name
+
         def command_specs(self) -> list[PaletteCommand]:
             return [
                 PaletteCommand("Show Activity", "show_activity", "activity logs", "Switch to activity stream"),
@@ -1812,7 +1844,7 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             summary = (
                 f"{self.note}  |  Active: {VIEW_LABELS[self.active_view_name()]}  |  "
                 f"Mode: {state.runtime['RALPH_RUNTIME_MODE']}  |  "
-                f"Model: {state.runtime['RALPH_RUNTIME_MODEL']}  |  "
+                f"Model: {resolved_model_label(state)}  |  "
                 f"Filter: {FILTER_LABELS[self.active_file_view().current_filter_mode()]}  |  "
                 f"{split_summary}  |  {stale_summary}  |  "
                 f"{child_state}"
@@ -1840,12 +1872,20 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             if allow_toasts and current_signal and current_signal != previous_signal:
                 signal_name = signal_from_line(current_signal)
                 if signal_name:
-                    self.notify(
-                        current_signal[-160:],
-                        title=f"Ralph {signal_name}",
-                        severity=signal_notification_severity(signal_name),
-                        timeout=4,
-                    )
+                    if signal_name == "COMPLETE" and not state.is_complete:
+                        self.notify(
+                            "Agent signaled COMPLETE, but unchecked criteria still remain.",
+                            title="Ralph Needs Another Pass",
+                            severity="warning",
+                            timeout=4,
+                        )
+                    else:
+                        self.notify(
+                            current_signal[-160:],
+                            title=f"Ralph {signal_name}",
+                            severity=signal_notification_severity(signal_name),
+                            timeout=4,
+                        )
 
             if allow_toasts and state.is_stale and not previous_state.is_stale and state.stale_seconds is not None:
                 self.notify(
@@ -1981,9 +2021,36 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 await asyncio.to_thread(self.console_handle.close)
             self.console_handle = None
 
+        async def request_workspace_stop(self, reason: str) -> bool:
+            stop_script = self.resolve_script_path("ralph-stop.sh")
+            if not stop_script.exists():
+                return False
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    str(stop_script),
+                    str(self.workspace),
+                    reason,
+                    "dashboard",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    cwd=self.workspace,
+                )
+            except Exception as exc:
+                append_dashboard_error(self.workspace, f"Failed to launch stop helper: {exc}")
+                return False
+            return await process.wait() == 0
+
         async def stop_child_loop(self) -> None:
+            stop_reason = "Stopped from dashboard"
+            helper_stopped = await self.request_workspace_stop(stop_reason)
+
             if self.child_process is None or self.child_process.returncode is not None:
-                self.set_note("No launched Ralph loop is running.")
+                if helper_stopped:
+                    self.refresh_dashboard()
+                    self.set_note("Stopped Ralph and cleaned up the workspace run.")
+                    self.notify("Stopped the Ralph run for this workspace.", title="Loop Stopped", timeout=3)
+                else:
+                    self.set_note("No launched Ralph loop is running.")
                 return
 
             assert self.child_process.pid is not None
@@ -2009,8 +2076,13 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
 
             self.child_process = None
             await self.close_console_handle()
-            self.set_note("Stopped the launched Ralph loop.")
-            self.notify("Stopped the dashboard-launched Ralph loop.", title="Loop Stopped", timeout=3)
+            self.refresh_dashboard()
+            if helper_stopped:
+                self.set_note("Stopped the launched Ralph loop and cleaned up the agent.")
+                self.notify("Stopped the dashboard-launched Ralph loop.", title="Loop Stopped", timeout=3)
+            else:
+                self.set_note("Stopped the launched Ralph loop.")
+                self.notify("Stopped the dashboard-launched Ralph loop.", title="Loop Stopped", timeout=3)
 
         def show_view(self, view_name: str, *, announce: bool = True) -> None:
             self.query_one(TabbedContent).active = view_name
