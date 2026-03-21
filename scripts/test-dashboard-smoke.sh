@@ -589,9 +589,20 @@ tasks = ns["tracked_task_items"](workspace / "RALPH_TASK.md")
 assert len(tasks) == 3, tasks
 assert tasks[1].label == "Dashboard shows current task state", tasks[1]
 assert not tasks[1].done, tasks[1]
+assert ns["current_task_index"](tasks) == 1, tasks
+
+window, current_index = ns["task_sidebar_window"](tasks, before=1, after=1)
+assert len(window) == 3, window
+assert current_index == 1, current_index
+assert window[current_index].label == "Dashboard shows current task state", window
 
 signals = ns["recent_signal_items"](workspace / ".ralph/signals.log")
 assert signals[-1].signal == "WARN", signals
+
+state = ns["load_dashboard_state"](workspace)
+assert len(state.task_items) == 3, state.task_items
+assert state.task_items[1].label == "Dashboard shows current task state", state.task_items
+assert state.signal_items[-1].signal == "WARN", state.signal_items
 PY
 }
 

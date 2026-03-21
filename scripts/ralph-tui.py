@@ -12,10 +12,11 @@ import re
 import shlex
 import signal
 import sys
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import IO, Any, Callable
+from typing import IO, Any, Awaitable, Callable
 
 
 LOG_TAIL_LIMITS = {
@@ -31,6 +32,8 @@ TOKEN_BUDGET = 200000
 WIDESCREEN_MIN_WIDTH = 150
 WIDESCREEN_MIN_HEIGHT = 42
 SIDEBAR_MIN_WIDTH = 160
+TASK_RAIL_CONTEXT_BEFORE = 2
+TASK_RAIL_CONTEXT_AFTER = 6
 
 VIEW_ORDER = ("activity", "progress", "tasks", "signals", "errors", "console")
 VIEW_LABELS = {
@@ -164,6 +167,8 @@ class DashboardState:
     stale_seconds: int | None
     is_stale: bool
     is_complete: bool
+    task_items: list[TaskChecklistItem]
+    signal_items: list[SignalSidebarItem]
     views: dict[str, FileViewState]
 
 
@@ -374,46 +379,19 @@ def parse_command_bar_input(raw: str) -> CommandIntent:
     return CommandIntent("search", command)
 
 
-def count_task_progress(task_file: Path) -> tuple[int, int]:
-    if not task_file.exists():
-        return 0, 0
-
-    total = 0
-    done = 0
-    for line in task_file.read_text(encoding="utf-8", errors="replace").splitlines():
-        stripped = line.lstrip()
-        if not stripped:
-            continue
-        if not (
-            stripped.startswith("- [")
-            or stripped.startswith("* [")
-            or (stripped[0].isdigit() and ". [" in stripped[:8])
-        ):
-            continue
-        if "[x]" in stripped.lower():
-            done += 1
-            total += 1
-        elif "[ ]" in stripped:
-            total += 1
-    return done, total
+def is_checklist_line(stripped: str) -> bool:
+    return (
+        stripped.startswith("- [")
+        or stripped.startswith("* [")
+        or (bool(stripped) and stripped[0].isdigit() and ". [" in stripped[:8])
+    )
 
 
-def tracked_task_items(task_file: Path) -> list[TaskChecklistItem]:
-    if not task_file.exists():
-        return []
-
+def tracked_task_items_from_lines(lines: list[str]) -> list[TaskChecklistItem]:
     items: list[TaskChecklistItem] = []
-    for raw_line, line in enumerate(
-        task_file.read_text(encoding="utf-8", errors="replace").splitlines()
-    ):
+    for raw_line, line in enumerate(lines):
         stripped = line.lstrip()
-        if not stripped:
-            continue
-        if not (
-            stripped.startswith("- [")
-            or stripped.startswith("* [")
-            or (stripped[0].isdigit() and ". [" in stripped[:8])
-        ):
+        if not stripped or not is_checklist_line(stripped):
             continue
 
         lowered = stripped.lower()
@@ -426,40 +404,79 @@ def tracked_task_items(task_file: Path) -> list[TaskChecklistItem]:
     return items
 
 
+def tracked_task_items_from_text(raw: str) -> list[TaskChecklistItem]:
+    return tracked_task_items_from_lines(raw.splitlines()) if raw else []
+
+
+def count_task_progress_from_items(items: list[TaskChecklistItem]) -> tuple[int, int]:
+    total = len(items)
+    done = sum(1 for item in items if item.done)
+    return done, total
+
+
+def count_task_progress(task_file: Path) -> tuple[int, int]:
+    if not task_file.exists():
+        return 0, 0
+    return count_task_progress_from_items(tracked_task_items(task_file))
+
+
+def tracked_task_items(task_file: Path) -> list[TaskChecklistItem]:
+    if not task_file.exists():
+        return []
+    return tracked_task_items_from_text(read_file_text(task_file))
+
+
+def current_task_index(items: list[TaskChecklistItem]) -> int | None:
+    for index, item in enumerate(items):
+        if not item.done:
+            return index
+    if items:
+        return len(items) - 1
+    return None
+
+
+def task_sidebar_window(
+    items: list[TaskChecklistItem],
+    before: int = TASK_RAIL_CONTEXT_BEFORE,
+    after: int = TASK_RAIL_CONTEXT_AFTER,
+) -> tuple[list[TaskChecklistItem], int | None]:
+    if not items:
+        return [], None
+
+    current_index = current_task_index(items)
+    if current_index is None:
+        return items[: after + 1], None
+
+    start = max(0, current_index - before)
+    end = min(len(items), current_index + after + 1)
+    window = items[start:end]
+    return window, current_index - start
+
+
 def next_task_label(task_file: Path) -> str:
     if not task_file.exists():
         return "No task file yet"
 
-    for raw_line in task_file.read_text(encoding="utf-8", errors="replace").splitlines():
-        stripped = raw_line.lstrip()
-        if "[ ]" not in stripped:
-            continue
-        if stripped.startswith("- ") or stripped.startswith("* ") or (
-            stripped and stripped[0].isdigit() and ". " in stripped[:8]
-        ):
-            marker = stripped.find("[ ]")
-            if marker != -1:
-                return stripped[marker + 3 :].strip()
+    for item in tracked_task_items(task_file):
+        if not item.done:
+            return item.label
     return "All visible criteria checked"
 
 
-def latest_token_summary(activity_file: Path, session: dict[str, str]) -> tuple[int, int]:
+def latest_token_summary_from_text(activity_text: str, session: dict[str, str]) -> tuple[int, int]:
     token_count = 0
     token_pct = 0
 
-    if activity_file.exists():
-        for line in reversed(
-            activity_file.read_text(encoding="utf-8", errors="replace").splitlines()
-        ):
-            if "TOKENS:" not in line:
-                continue
-            try:
-                before_pct = line.split("(", 1)[1]
-                token_pct = int(before_pct.split("%", 1)[0])
-                token_count = int(line.split("TOKENS:", 1)[1].split("/", 1)[0].strip())
-                return token_count, token_pct
-            except (IndexError, ValueError):
-                break
+    for line in reversed(activity_text.splitlines()):
+        if "TOKENS:" not in line:
+            continue
+        try:
+            before_pct = line.split("(", 1)[1]
+            token_pct = int(before_pct.split("%", 1)[0])
+            token_count = int(line.split("TOKENS:", 1)[1].split("/", 1)[0].strip())
+            return token_count, token_pct
+        except (IndexError, ValueError):
+            break
 
     raw_tokens = session.get("RALPH_SESSION_TOKENS", "0")
     try:
@@ -470,6 +487,10 @@ def latest_token_summary(activity_file: Path, session: dict[str, str]) -> tuple[
     if token_count > 0:
         token_pct = int(token_count * 100 / TOKEN_BUDGET)
     return token_count, token_pct
+
+
+def latest_token_summary(activity_file: Path, session: dict[str, str]) -> tuple[int, int]:
+    return latest_token_summary_from_text(read_file_text(activity_file), session)
 
 
 def current_session_metadata(state: DashboardState) -> dict[str, str]:
@@ -604,11 +625,16 @@ def build_empty_view_state(path: Path, view_name: str, headline: str) -> FileVie
     )
 
 
-def build_view_state(path: Path, view_name: str) -> FileViewState:
-    if not path.exists():
+def build_view_state_from_text(
+    path: Path,
+    view_name: str,
+    raw: str,
+    *,
+    exists: bool,
+) -> FileViewState:
+    if not exists:
         return build_empty_view_state(path, view_name, f"{VIEW_LABELS[view_name]} is on standby.")
 
-    raw = read_file_text(path)
     lines = raw.splitlines()
     total_lines = len(lines)
     if total_lines == 0:
@@ -638,6 +664,11 @@ def build_view_state(path: Path, view_name: str) -> FileViewState:
         exists=True,
         line_count=total_lines,
     )
+
+
+def build_view_state(path: Path, view_name: str) -> FileViewState:
+    exists = path.exists()
+    return build_view_state_from_text(path, view_name, read_file_text(path), exists=exists)
 
 
 def latest_content_line(body: str, predicate: Callable[[str], bool] | None = None) -> str:
@@ -699,14 +730,9 @@ def recent_signal_timeline(lines: list[str]) -> list[str]:
     return timeline[-6:]
 
 
-def recent_signal_items(signals_file: Path, limit: int = 40) -> list[SignalSidebarItem]:
-    if not signals_file.exists():
-        return []
-
+def signal_items_from_lines(lines: list[str]) -> list[SignalSidebarItem]:
     items: list[SignalSidebarItem] = []
-    for raw_line, line in enumerate(
-        signals_file.read_text(encoding="utf-8", errors="replace").splitlines()
-    ):
+    for raw_line, line in enumerate(lines):
         if signal_name := signal_from_line(line):
             items.append(
                 SignalSidebarItem(
@@ -715,7 +741,17 @@ def recent_signal_items(signals_file: Path, limit: int = 40) -> list[SignalSideb
                     line=clip_text(line, width=120),
                 )
             )
-    return items[-limit:]
+    return items
+
+
+def recent_signal_items_from_text(raw: str, limit: int = 40) -> list[SignalSidebarItem]:
+    return signal_items_from_lines(raw.splitlines())[-limit:]
+
+
+def recent_signal_items(signals_file: Path, limit: int = 40) -> list[SignalSidebarItem]:
+    if not signals_file.exists():
+        return []
+    return recent_signal_items_from_text(read_file_text(signals_file), limit=limit)
 
 
 def errorish_line(line: str) -> bool:
@@ -881,20 +917,27 @@ def load_dashboard_state(workspace: Path) -> DashboardState:
     runtime = read_shell_env(ralph_dir / "runtime.env")
     session = read_shell_env(ralph_dir / ".last-session.env")
     task_file = select_task_file(workspace)
-    done_count, total_count = count_task_progress(task_file)
-    remaining_count = max(total_count - done_count, 0)
-    token_count, token_pct = latest_token_summary(ralph_dir / "activity.log", session)
-
-    signal_lines: list[str] = []
-    latest_signals: list[str] = []
-    signals_file = ralph_dir / "signals.log"
-    if signals_file.exists():
-        signal_lines = signals_file.read_text(encoding="utf-8", errors="replace").splitlines()
-        latest_signals = [line for line in signal_lines if signal_from_line(line)][-4:]
-
     view_paths = view_paths_for_workspace(workspace, task_file)
+    raw_views = {
+        view_name: read_file_text(path)
+        for view_name, path in view_paths.items()
+    }
+    task_items = tracked_task_items_from_text(raw_views["tasks"])
+    done_count, total_count = count_task_progress_from_items(task_items)
+    remaining_count = max(total_count - done_count, 0)
+    token_count, token_pct = latest_token_summary_from_text(raw_views["activity"], session)
+
+    signal_lines = raw_views["signals"].splitlines()
+    signal_items = signal_items_from_lines(signal_lines)
+    latest_signals = [line for line in signal_lines if signal_from_line(line)][-4:]
+
     views = {
-        view_name: build_view_state(path, view_name)
+        view_name: build_view_state_from_text(
+            path,
+            view_name,
+            raw_views[view_name],
+            exists=path.exists(),
+        )
         for view_name, path in view_paths.items()
     }
 
@@ -929,7 +972,9 @@ def load_dashboard_state(workspace: Path) -> DashboardState:
         done_count=done_count,
         total_count=total_count,
         remaining_count=remaining_count,
-        next_task=next_task_label(task_file),
+        next_task=next((item.label for item in task_items if not item.done), "All visible criteria checked")
+        if task_file.exists()
+        else "No task file yet",
         token_count=token_count,
         token_pct=token_pct,
         health_label=health_label(token_pct),
@@ -938,6 +983,8 @@ def load_dashboard_state(workspace: Path) -> DashboardState:
         stale_seconds=stale_seconds,
         is_stale=is_stale,
         is_complete=is_complete,
+        task_items=task_items,
+        signal_items=signal_items[-60:],
         views=views,
     )
 
@@ -980,6 +1027,8 @@ def build_placeholder_state(workspace: Path) -> DashboardState:
         stale_seconds=None,
         is_stale=False,
         is_complete=False,
+        task_items=[],
+        signal_items=[],
         views=views,
     )
 
@@ -1194,7 +1243,7 @@ def normalize_args(args: argparse.Namespace) -> tuple[str, Path, list[str]]:
 def require_textual() -> None:
     python_bin = os.environ.get("PYTHON_BIN", sys.executable)
     try:
-        import textual  # noqa: F401
+        __import__("textual")
     except ImportError as exc:  # pragma: no cover - exercised manually
         print("❌ The Ralph dashboard now uses Python + Textual.", file=sys.stderr)
         print("", file=sys.stderr)
@@ -1283,16 +1332,30 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             self.view_name = source.view_name
 
     class TaskEntry(Option):
-        def __init__(self, item: TaskChecklistItem) -> None:
+        def __init__(self, item: TaskChecklistItem, *, current: bool = False) -> None:
             marker = "[x]" if item.done else "[ ]"
             self.label_text = clip_text(item.label, width=72)
             prompt = Text()
-            prompt.append(marker, style="dim #2a9d8f" if item.done else "bold #ffd166")
+            if current:
+                prompt.append("NOW", style="bold #081c15 on #ffd166")
+                prompt.append(" ", style="#f7f4ea")
+            prompt.append(
+                marker,
+                style=(
+                    "dim #2a9d8f"
+                    if item.done
+                    else ("bold #081c15 on #8ecae6" if current else "bold #ffd166")
+                ),
+            )
             prompt.append(" ")
-            prompt.append(self.label_text, style="#f7f4ea")
+            prompt.append(
+                self.label_text,
+                style=("bold #fefae0" if current else "#f7f4ea"),
+            )
             super().__init__(prompt)
             self.raw_line = item.raw_line
             self.done = item.done
+            self.current = current
 
     class SignalEntry(Option):
         def __init__(self, item: SignalSidebarItem) -> None:
@@ -2117,7 +2180,10 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             self.note = "Dashboard ready."
             self.tick = 0
             self.last_state = build_placeholder_state(workspace)
-            self.refresh_in_flight = False
+            self.refresh_pending = False
+            self.refresh_pending_toasts = False
+            self.refresh_task: asyncio.Task[Any] | None = None
+            self.last_refresh_ok = True
             self.search_open = False
             self.palette_open = False
             self.palette_selected = 0
@@ -2131,6 +2197,8 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             self.child_exit_code = 0
             self.console_handle: IO[str] | None = None
             self.child_wait_task: asyncio.Task[None] | None = None
+            self.background_tasks: set[asyncio.Task[Any]] = set()
+            self.shutting_down = False
             self.console_path = workspace / ".ralph" / "tui-run.log"
 
         def compose(self) -> ComposeResult:
@@ -2205,7 +2273,7 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             self.schedule_refresh()
             self.set_interval(0.5, self.schedule_refresh)
             if self.mode == "loop":
-                asyncio.create_task(self.start_child_loop())
+                self.start_background_task(self.start_child_loop(), label="loop launcher")
             if self.smoke_exit:
                 self.set_timer(0.2, self.exit)
 
@@ -2253,6 +2321,65 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                     return candidate
             return self.companion_view_name
 
+        def report_background_exception(
+            self,
+            label: str,
+            exc: BaseException,
+            *,
+            notify: bool = True,
+        ) -> None:
+            message = f"{label} failed: {exc}"
+            detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+            append_dashboard_error(
+                self.workspace,
+                f"{message}\n{detail}" if detail else message,
+            )
+            if self.shutting_down:
+                return
+            self.set_note(message)
+            if notify:
+                self.notify(message, title="Dashboard Task Failed", severity="error", timeout=6)
+
+        def start_background_task(
+            self,
+            awaitable: Awaitable[Any],
+            *,
+            label: str,
+            notify_on_error: bool = True,
+        ) -> asyncio.Task[Any]:
+            task = asyncio.create_task(awaitable, name=f"ralph:{label.replace(' ', '_')}")
+            self.background_tasks.add(task)
+
+            def _cleanup(done_task: asyncio.Task[Any]) -> None:
+                self.background_tasks.discard(done_task)
+                with contextlib.suppress(asyncio.CancelledError):
+                    exception = done_task.exception()
+                    if exception is not None:
+                        self.report_background_exception(label, exception, notify=notify_on_error)
+
+            task.add_done_callback(_cleanup)
+            return task
+
+        def request_refresh(self, *, allow_toasts: bool = True) -> None:
+            self.refresh_pending = True
+            self.refresh_pending_toasts = self.refresh_pending_toasts or allow_toasts
+            if self.refresh_task is not None and not self.refresh_task.done():
+                return
+            self.refresh_task = self.start_background_task(
+                self.drain_refresh_requests(),
+                label="refresh worker",
+                notify_on_error=False,
+            )
+
+        async def refresh_now(self, *, allow_toasts: bool = True) -> bool:
+            self.request_refresh(allow_toasts=allow_toasts)
+            if self.refresh_task is not None:
+                try:
+                    await self.refresh_task
+                except Exception:
+                    self.last_refresh_ok = False
+            return self.last_refresh_ok
+
         def update_command_bar(self) -> None:
             state = self.last_state
             hints = ["tasks", "signals", "filter interesting", "hot", "stop"]
@@ -2276,25 +2403,46 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             else:
                 sidebar.add_class("hidden")
 
-        def _replace_option_list(self, widget_id: str, options: list[Option]) -> None:
+        def _replace_option_list(
+            self,
+            widget_id: str,
+            options: list[Option],
+            *,
+            preferred_highlight: int | None = None,
+            keep_visible: bool = False,
+        ) -> None:
             option_list = self.query_one(widget_id, OptionList)
             previous = option_list.highlighted
             option_list.clear_options()
             for option in options:
                 option_list.add_option(option)
-            if previous is not None and options:
+            if not options:
+                option_list.highlighted = None
+                return
+            if preferred_highlight is not None:
+                option_list.highlighted = max(0, min(preferred_highlight, len(options) - 1))
+                if keep_visible:
+                    option_list.call_after_refresh(option_list.scroll_to_highlight)
+                return
+            if previous is not None:
                 option_list.highlighted = min(previous, len(options) - 1)
 
         def update_sidebar(self) -> None:
             state = self.last_state
             watch_options = [WatchEntry(source) for source in build_feedback_sources(state)]
-            task_options = [TaskEntry(item) for item in tracked_task_items(state.task_file)[:80]]
-            signal_options = [
-                SignalEntry(item)
-                for item in recent_signal_items(state.views["signals"].path, limit=60)
+            task_window, current_index = task_sidebar_window(state.task_items)
+            task_options = [
+                TaskEntry(item, current=index == current_index)
+                for index, item in enumerate(task_window)
             ]
+            signal_options = [SignalEntry(item) for item in state.signal_items]
             self._replace_option_list("#watch-list", watch_options)
-            self._replace_option_list("#task-list", task_options)
+            self._replace_option_list(
+                "#task-list",
+                task_options,
+                preferred_highlight=current_index,
+                keep_visible=True,
+            )
             self._replace_option_list("#signal-list", signal_options)
 
         def resolve_script_path(self, script_name: str) -> Path:
@@ -2435,7 +2583,7 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             handler = getattr(self, f"action_{action_name}")
             result = handler()
             if inspect.isawaitable(result):
-                asyncio.create_task(result)
+                self.start_background_task(result, label=f"action {action_name}")
 
         def run_palette_selection(self) -> None:
             if not self.palette_matches:
@@ -2559,6 +2707,29 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 return
             if intent.kind == "search":
                 self.apply_search_query(intent.argument)
+
+        def apply_dashboard_state(
+            self,
+            previous_state: DashboardState,
+            state: DashboardState,
+            *,
+            allow_toasts: bool = True,
+        ) -> None:
+            self.update_unread_counts(previous_state, state)
+            self.last_state = state
+            for view_name in VIEW_ORDER:
+                self.query_one(f"#{view_name}-view", FileView).set_state(state.views[view_name])
+            self.emit_notifications(previous_state, state, allow_toasts=allow_toasts)
+            self.update_tab_labels()
+            self.update_cards()
+            self.update_command_bar()
+            self.update_help_strip()
+            self.update_timeline_strip()
+            self.update_celebration_strip()
+            self.update_sidebar_layout()
+            self.update_sidebar()
+            self.update_split_layout()
+            self.update_status_strip()
 
         def update_cards(self) -> None:
             state = self.last_state
@@ -2856,53 +3027,47 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             companion_view.set_state(self.last_state.views[companion_name])
 
         def schedule_refresh(self) -> None:
-            if self.refresh_in_flight:
-                return
-            self.refresh_in_flight = True
-            asyncio.create_task(self.refresh_dashboard_async())
+            self.request_refresh(allow_toasts=True)
 
-        async def refresh_dashboard_async(self) -> None:
+        async def drain_refresh_requests(self) -> None:
             try:
-                self.tick += 1
-                previous_state = self.last_state
-                state = await asyncio.to_thread(load_dashboard_state, self.workspace)
-                self.update_unread_counts(previous_state, state)
-                self.last_state = state
-                for view_name in VIEW_ORDER:
-                    self.query_one(f"#{view_name}-view", FileView).set_state(state.views[view_name])
-                self.emit_notifications(previous_state, state)
-                self.update_tab_labels()
-                self.update_cards()
-                self.update_command_bar()
-                self.update_help_strip()
-                self.update_timeline_strip()
-                self.update_celebration_strip()
-                self.update_sidebar_layout()
-                self.update_sidebar()
-                self.update_split_layout()
-                self.update_status_strip()
+                while self.refresh_pending:
+                    allow_toasts = self.refresh_pending_toasts
+                    self.refresh_pending = False
+                    self.refresh_pending_toasts = False
+                    await self.refresh_dashboard_async(allow_toasts=allow_toasts)
             finally:
-                self.refresh_in_flight = False
+                should_restart = self.refresh_pending and not self.shutting_down
+                allow_toasts = self.refresh_pending_toasts
+                self.refresh_task = None
+                if should_restart:
+                    self.request_refresh(allow_toasts=allow_toasts)
 
-        def refresh_dashboard(self) -> None:
+        async def refresh_dashboard_async(self, *, allow_toasts: bool = True) -> bool:
             self.tick += 1
             previous_state = self.last_state
-            state = load_dashboard_state(self.workspace)
-            self.update_unread_counts(previous_state, state)
-            self.last_state = state
-            for view_name in VIEW_ORDER:
-                self.query_one(f"#{view_name}-view", FileView).set_state(state.views[view_name])
-            self.emit_notifications(previous_state, state, allow_toasts=False)
-            self.update_tab_labels()
-            self.update_cards()
-            self.update_command_bar()
-            self.update_help_strip()
-            self.update_timeline_strip()
-            self.update_celebration_strip()
-            self.update_sidebar_layout()
-            self.update_sidebar()
-            self.update_split_layout()
-            self.update_status_strip()
+            try:
+                state = await asyncio.to_thread(load_dashboard_state, self.workspace)
+            except Exception as exc:
+                self.last_refresh_ok = False
+                self.report_background_exception("dashboard refresh", exc, notify=False)
+                return False
+            self.apply_dashboard_state(previous_state, state, allow_toasts=allow_toasts)
+            self.last_refresh_ok = True
+            return True
+
+        def refresh_dashboard(self, *, allow_toasts: bool = False) -> bool:
+            self.tick += 1
+            previous_state = self.last_state
+            try:
+                state = load_dashboard_state(self.workspace)
+            except Exception as exc:
+                self.last_refresh_ok = False
+                self.report_background_exception("dashboard refresh", exc, notify=False)
+                return False
+            self.apply_dashboard_state(previous_state, state, allow_toasts=allow_toasts)
+            self.last_refresh_ok = True
+            return True
 
         async def start_child_loop(self) -> None:
             if self.child_process is not None and self.child_process.returncode is None:
@@ -2935,7 +3100,11 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 self.notify(message, title="Dashboard launch failed", severity="error", timeout=6)
                 return
 
-            self.child_wait_task = asyncio.create_task(self.wait_for_child_loop())
+            self.child_wait_task = self.start_background_task(
+                self.wait_for_child_loop(),
+                label="loop watcher",
+                notify_on_error=False,
+            )
             self.set_note("Launched Ralph loop in the background.")
             self.notify("Ralph loop started in the background.", title="Loop Started", timeout=3)
 
@@ -2943,12 +3112,17 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             if self.child_process is None:
                 return
 
+            task = asyncio.current_task()
             process = self.child_process
             exit_code = await process.wait()
             self.child_exit_code = exit_code
             if self.child_process is process:
                 self.child_process = None
             await self.close_console_handle()
+            if self.child_wait_task is task:
+                self.child_wait_task = None
+            if self.shutting_down:
+                return
             self.set_note(f"Background Ralph loop finished with exit code {exit_code}.")
             self.notify(
                 f"Background Ralph loop exited with code {exit_code}.",
@@ -2987,7 +3161,7 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
 
             if self.child_process is None or self.child_process.returncode is not None:
                 if helper_stopped:
-                    self.refresh_dashboard()
+                    await self.refresh_now(allow_toasts=False)
                     self.set_note("Stopped Ralph and cleaned up the workspace run.")
                     self.notify("Stopped the Ralph run for this workspace.", title="Loop Stopped", timeout=3)
                 else:
@@ -3017,7 +3191,7 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
 
             self.child_process = None
             await self.close_console_handle()
-            self.refresh_dashboard()
+            await self.refresh_now(allow_toasts=False)
             if helper_stopped:
                 self.set_note("Stopped the launched Ralph loop and cleaned up the agent.")
                 self.notify("Stopped the dashboard-launched Ralph loop.", title="Loop Stopped", timeout=3)
@@ -3075,7 +3249,10 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 return
             if event.input.id == "command-input":
                 event.input.value = ""
-                asyncio.create_task(self.execute_command_intent(parse_command_bar_input(event.value)))
+                self.start_background_task(
+                    self.execute_command_intent(parse_command_bar_input(event.value)),
+                    label="command intent",
+                )
                 return
             if event.input.id == "palette-input":
                 self.run_palette_selection()
@@ -3293,8 +3470,8 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 self.update_split_layout()
 
         async def action_refresh_now(self) -> None:
-            await self.refresh_dashboard_async()
-            self.set_note("Manual refresh complete.")
+            if await self.refresh_now():
+                self.set_note("Manual refresh complete.")
 
         def action_toggle_help(self) -> None:
             self.help_expanded = not self.help_expanded
@@ -3314,6 +3491,11 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             self.exit()
 
         def finalize(self) -> None:
+            self.shutting_down = True
+            self.refresh_pending = False
+            self.refresh_pending_toasts = False
+            for task in list(self.background_tasks):
+                task.cancel()
             if self.child_wait_task is not None:
                 self.child_wait_task.cancel()
                 self.child_wait_task = None
