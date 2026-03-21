@@ -11,7 +11,9 @@ import os
 import re
 import shlex
 import signal
+import subprocess
 import sys
+import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
@@ -32,6 +34,8 @@ TOKEN_BUDGET = 200000
 WIDESCREEN_MIN_WIDTH = 150
 WIDESCREEN_MIN_HEIGHT = 42
 SIDEBAR_MIN_WIDTH = 160
+DASHBOARD_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+ACTIVE_RUNTIME_STATUSES = {"running", "starting", "rotating", "gutter", "loop", "looping"}
 TASK_RAIL_CONTEXT_BEFORE = 2
 TASK_RAIL_CONTEXT_AFTER = 6
 
@@ -129,6 +133,15 @@ FILTER_ALIASES = {
     "errors": "errors",
     "error": "errors",
 }
+FRESHNESS_LABELS = {
+    "runtime": "Runtime",
+    "session": "Session",
+    "activity": "Activity",
+    "progress": "Progress",
+    "signals": "Signals",
+    "errors": "Errors",
+    "console": "Console",
+}
 
 
 @dataclass
@@ -166,6 +179,7 @@ class DashboardState:
     signal_timeline: list[str]
     stale_seconds: int | None
     is_stale: bool
+    freshness_source: str
     is_complete: bool
     task_items: list[TaskChecklistItem]
     signal_items: list[SignalSidebarItem]
@@ -609,6 +623,35 @@ def age_for_path(path: Path) -> int | None:
     return max(int((datetime.now() - timestamp).total_seconds()), 0)
 
 
+def pid_is_running(pid: int | None) -> bool:
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def freshness_sources_for_workspace(
+    workspace: Path,
+    task_file: Path,
+) -> list[tuple[str, Path | None]]:
+    ralph_dir = workspace / ".ralph"
+    view_paths = view_paths_for_workspace(workspace, task_file)
+    return [
+        ("runtime", ralph_dir / "runtime.env"),
+        ("session", ralph_dir / ".last-session.env"),
+        ("activity", view_paths["activity"]),
+        ("progress", view_paths["progress"]),
+        ("signals", view_paths["signals"]),
+        ("errors", view_paths["errors"]),
+        ("console", view_paths["console"]),
+    ]
+
+
 def build_empty_view_state(path: Path, view_name: str, headline: str) -> FileViewState:
     lines = [
         headline,
@@ -896,20 +939,58 @@ def mood_snapshot(state: DashboardState) -> tuple[str, str, str]:
     return "\\o/", "turbo wiggle", "#ffd166"
 
 
-def staleness_snapshot(runtime: dict[str, str], heartbeat_paths: list[Path]) -> tuple[int | None, bool]:
+def format_freshness(state: DashboardState) -> str:
+    if state.stale_seconds is None:
+        return "idle"
+    source = FRESHNESS_LABELS.get(state.freshness_source, state.freshness_source or "Activity")
+    if state.is_stale:
+        return f"STALE for {state.stale_seconds}s"
+    return f"fresh via {source} {format_age(state.stale_seconds)} ago"
+
+
+def dashboard_activity_indicator(state: DashboardState, tick: int) -> tuple[str, str, str]:
+    status = state.runtime.get("RALPH_RUNTIME_STATUS", "").lower()
+    source = FRESHNESS_LABELS.get(state.freshness_source, state.freshness_source or "Activity").lower()
+
+    if state.is_complete or status in {"complete", "completed", "done"}:
+        return "●", "complete", "#2a9d8f"
+    if status in ACTIVE_RUNTIME_STATUSES:
+        if state.is_stale:
+            return "○", "waiting for fresh movement", "#e76f51"
+        frame = DASHBOARD_SPINNER_FRAMES[tick % len(DASHBOARD_SPINNER_FRAMES)]
+        return frame, f"active via {source}", "#ffd166"
+    if status in {"deferred"}:
+        return "◌", "deferred", "#f4a261"
+    if status in {"error", "abort", "aborted"}:
+        return "●", "needs attention", "#e76f51"
+    if status in {"stopped"}:
+        return "■", "stopped", "#90e0ef"
+    return "·", "idle", "#90e0ef"
+
+
+def staleness_snapshot(
+    runtime: dict[str, str],
+    heartbeat_sources: list[tuple[str, Path | None]],
+) -> tuple[int | None, bool, str]:
     status = runtime.get("RALPH_RUNTIME_STATUS", "").lower()
     if status not in {"running", "starting", "rotating", "gutter", "loop", "looping"}:
-        return None, False
+        return None, False, ""
 
-    timestamps = [parse_runtime_timestamp(runtime.get("RALPH_RUNTIME_UPDATED_AT", ""))]
-    timestamps.extend(file_timestamp(path) for path in heartbeat_paths)
-    fresh_candidates = [timestamp for timestamp in timestamps if timestamp is not None]
-    if not fresh_candidates:
-        return None, False
+    freshest_candidates: list[tuple[datetime, str]] = []
+    if runtime_timestamp := parse_runtime_timestamp(runtime.get("RALPH_RUNTIME_UPDATED_AT", "")):
+        freshest_candidates.append((runtime_timestamp, "runtime"))
+    for source_name, path in heartbeat_sources:
+        if path is None:
+            continue
+        if timestamp := file_timestamp(path):
+            freshest_candidates.append((timestamp, source_name))
 
-    updated_at = max(fresh_candidates)
+    if not freshest_candidates:
+        return None, False, ""
+
+    updated_at, source_name = max(freshest_candidates, key=lambda item: item[0])
     age_seconds = max(int((datetime.now() - updated_at).total_seconds()), 0)
-    return age_seconds, age_seconds >= STALE_AFTER_SECONDS
+    return age_seconds, age_seconds >= STALE_AFTER_SECONDS, source_name
 
 
 def load_dashboard_state(workspace: Path) -> DashboardState:
@@ -953,13 +1034,9 @@ def load_dashboard_state(workspace: Path) -> DashboardState:
     for key, value in runtime_defaults.items():
         runtime.setdefault(key, value)
 
-    stale_seconds, is_stale = staleness_snapshot(
+    stale_seconds, is_stale, freshness_source = staleness_snapshot(
         runtime,
-        [
-            ralph_dir / "activity.log",
-            ralph_dir / ".last-session.env",
-            ralph_dir / "signals.log",
-        ],
+        freshness_sources_for_workspace(workspace, task_file),
     )
     status_complete = runtime["RALPH_RUNTIME_STATUS"].lower() in {"complete", "completed", "done"}
     is_complete = status_complete and (total_count == 0 or remaining_count == 0)
@@ -982,6 +1059,7 @@ def load_dashboard_state(workspace: Path) -> DashboardState:
         signal_timeline=recent_signal_timeline(signal_lines),
         stale_seconds=stale_seconds,
         is_stale=is_stale,
+        freshness_source=freshness_source,
         is_complete=is_complete,
         task_items=task_items,
         signal_items=signal_items[-60:],
@@ -1026,6 +1104,7 @@ def build_placeholder_state(workspace: Path) -> DashboardState:
         signal_timeline=["NONE"],
         stale_seconds=None,
         is_stale=False,
+        freshness_source="",
         is_complete=False,
         task_items=[],
         signal_items=[],
@@ -1133,11 +1212,7 @@ def render_snapshot(state: DashboardState) -> str:
         f"Timeline: {' > '.join(state.signal_timeline)}",
         (
             "Freshness: "
-            + (
-                f"stale ({state.stale_seconds}s)"
-                if state.is_stale and state.stale_seconds is not None
-                else "fresh"
-            )
+            + format_freshness(state)
         ),
         "Views: activity progress tasks signals errors console",
         "Sources:",
@@ -1940,8 +2015,8 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
         }
 
         #feedback-card {
-            width: 2fr;
-            min-height: 11;
+            width: 1fr;
+            min-height: 13;
             margin-right: 0;
         }
 
@@ -2210,7 +2285,6 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                         yield Static(classes="card", id="progress-card")
                         yield Static(classes="card", id="telemetry-card")
                     with Horizontal(id="cards-bottom"):
-                        yield Static(classes="card", id="token-card")
                         yield Static(classes="card", id="feedback-card")
                 with Horizontal(id="command-bar"):
                     yield Static("Command", id="command-label")
@@ -2736,11 +2810,8 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             telemetry = session_telemetry(state.session)
             feedback_sources = build_feedback_sources(state)
             mascot, mood, mood_color = mood_snapshot(state)
-            freshness = (
-                f"STALE for {state.stale_seconds}s"
-                if state.is_stale and state.stale_seconds is not None
-                else "fresh"
-            )
+            freshness = format_freshness(state)
+            pulse_frame, pulse_label, pulse_color = dashboard_activity_indicator(state, self.tick)
             layout = (
                 f"buddy {VIEW_LABELS[self.current_companion_view()].lower()}"
                 if self.split_mode
@@ -2761,6 +2832,11 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                     "Cursor: " + cursor_session_summary(state),
                     style="#f7f4ea",
                     overflow="ellipsis",
+                ),
+                Text.assemble(
+                    ("Pulse: ", "#f7f4ea"),
+                    (pulse_frame, f"bold {pulse_color}"),
+                    (f" {pulse_label}", pulse_color),
                 ),
                 Text(f"Freshness: {freshness}  |  Layout: {layout}", style="#f7f4ea"),
                 Text(
@@ -2840,22 +2916,6 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             elif telemetry.thrash_path:
                 telemetry_table.add_row("Thrash path", clip_middle(telemetry.thrash_path, width=34))
 
-            token_rows = token_mix_rows(telemetry)
-            token_total = sum(value for _, value in token_rows)
-            token_table = Table.grid(expand=True)
-            token_table.add_column(justify="left")
-            token_table.add_column(justify="right")
-            if token_total <= 0:
-                token_table.add_row("Status", "Waiting for parser telemetry")
-            else:
-                for label, value in token_rows:
-                    if value <= 0:
-                        continue
-                    token_table.add_row(
-                        label,
-                        f"{render_progress_bar(value, token_total, width=14)} {format_count(value)}",
-                    )
-
             feedback_table = Table(
                 expand=True,
                 box=None,
@@ -2884,9 +2944,6 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             self.query_one("#telemetry-card", Static).update(
                 Panel(telemetry_table, title="Agent IO", border_style="#e9c46a")
             )
-            self.query_one("#token-card", Static).update(
-                Panel(token_table, title="Token Mix", border_style="#90e0ef")
-            )
             self.query_one("#feedback-card", Static).update(
                 Panel(feedback_table, title="Feedback Radar", border_style="#8ecae6")
             )
@@ -2906,10 +2963,11 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
         def update_timeline_strip(self) -> None:
             state = self.last_state
             message = "Signal Trail: " + " > ".join(state.signal_timeline)
+            freshness = format_freshness(state)
             if state.is_stale and state.stale_seconds is not None:
-                message += f"  |  stale for {state.stale_seconds}s"
+                message += f"  |  {freshness.lower()}"
             else:
-                message += "  |  logs look fresh"
+                message += f"  |  movement: {freshness}"
             self.query_one("#timeline-strip", Static).update(
                 Text(message, no_wrap=True, overflow="ellipsis")
             )
@@ -2945,14 +3003,15 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             stale_summary = (
                 f"Stale:{state.stale_seconds}s"
                 if state.is_stale and state.stale_seconds is not None
-                else "Fresh"
+                else format_freshness(state)
             )
+            pulse_frame, pulse_label, _ = dashboard_activity_indicator(state, self.tick)
             summary = (
                 f"{self.note}  |  Active: {VIEW_LABELS[self.active_view_name()]}  |  "
                 f"Mode: {state.runtime['RALPH_RUNTIME_MODE']}  |  "
                 f"Model: {resolved_model_label(state)}  |  "
                 f"Filter: {FILTER_LABELS[self.active_file_view().current_filter_mode()]}  |  "
-                f"{split_summary}  |  {rail_summary}  |  {stale_summary}  |  "
+                f"Pulse:{pulse_frame} {pulse_label}  |  {split_summary}  |  {rail_summary}  |  {stale_summary}  |  "
                 f"{child_state}"
             )
             self.query_one("#status-strip", Static).update(
@@ -3154,6 +3213,48 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 append_dashboard_error(self.workspace, f"Failed to launch stop helper: {exc}")
                 return False
             return await process.wait() == 0
+
+        def request_workspace_stop_sync(self, reason: str, *, source: str = "dashboard") -> bool:
+            stop_script = self.resolve_script_path("ralph-stop.sh")
+            if not stop_script.exists():
+                return False
+            try:
+                process = subprocess.run(
+                    [str(stop_script), str(self.workspace), reason, source],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    cwd=self.workspace,
+                    check=False,
+                    timeout=5,
+                )
+            except Exception as exc:
+                append_dashboard_error(self.workspace, f"Failed to launch stop helper: {exc}")
+                return False
+            return process.returncode == 0
+
+        def stop_child_loop_sync(self, reason: str) -> bool:
+            helper_stopped = self.request_workspace_stop_sync(reason, source="dashboard-finalize")
+            pid = self.child_process.pid if self.child_process is not None else None
+
+            if pid_is_running(pid):
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(pid, signal.SIGTERM)
+                deadline = time.monotonic() + 2.0
+                while pid_is_running(pid) and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                if pid_is_running(pid):
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(pid, signal.SIGKILL)
+                    deadline = time.monotonic() + 1.0
+                    while pid_is_running(pid) and time.monotonic() < deadline:
+                        time.sleep(0.05)
+
+            if self.console_handle is not None and not self.console_handle.closed:
+                self.console_handle.close()
+            self.console_handle = None
+            self.child_process = None
+            self.child_wait_task = None
+            return helper_stopped or not pid_is_running(pid)
 
         async def stop_child_loop(self) -> None:
             stop_reason = "Stopped from dashboard"
@@ -3503,9 +3604,12 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                 self.console_handle.close()
                 self.console_handle = None
             if self.child_process is not None and self.child_process.returncode is None:
-                with contextlib.suppress(ProcessLookupError):
-                    assert self.child_process.pid is not None
-                    os.killpg(self.child_process.pid, signal.SIGTERM)
+                stopped = self.stop_child_loop_sync("Dashboard closed while loop was running")
+                if not stopped:
+                    append_dashboard_error(
+                        self.workspace,
+                        "Dashboard finalize could not fully stop the Ralph loop cleanly.",
+                    )
 
     headless = os.environ.get("RALPH_TUI_HEADLESS") == "1"
     size = None

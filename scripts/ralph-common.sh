@@ -2410,9 +2410,14 @@ run_iteration() {
   # Change to workspace
   cd "$workspace"
   
-  # Start spinner to show we're alive
-  spinner "$workspace" &
-  local spinner_pid=$!
+  # Start the CLI spinner only for an actual terminal session.
+  # The Textual dashboard renders its own liveness indicator and should not
+  # capture a redraw loop into tui-run.log.
+  local spinner_pid=""
+  if [[ "${RALPH_TUI_ACTIVE:-0}" != "1" ]] && [[ -t 2 ]]; then
+    spinner "$workspace" &
+    spinner_pid=$!
+  fi
   
   # Start parser in background, reading from cursor-agent
   # Parser outputs to fifo, we read signals from fifo
@@ -2486,9 +2491,11 @@ run_iteration() {
   wait $agent_pid 2>/dev/null || agent_exit=$?
   
   # Stop spinner and clear line
-  kill $spinner_pid 2>/dev/null || true
-  wait $spinner_pid 2>/dev/null || true
-  printf "\r\033[K" >&2  # Clear spinner line
+  if [[ -n "$spinner_pid" ]]; then
+    kill "$spinner_pid" 2>/dev/null || true
+    wait "$spinner_pid" 2>/dev/null || true
+    printf "\r\033[K" >&2  # Clear spinner line
+  fi
   
   # Cleanup
   rm -f "$fifo"

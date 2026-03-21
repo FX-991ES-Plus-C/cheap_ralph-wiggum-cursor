@@ -298,6 +298,44 @@ EOF
   assert_contains "$workspace/run.stderr" "MODEL POLICY VIOLATION: requested auto but Cursor started Opus 4.6 1M Thinking"
 }
 
+run_tui_spinner_suppression_case() {
+  local workspace fakebin signal
+  workspace="$(make_workspace)"
+  fakebin="$workspace/fakebin"
+  mkdir -p "$fakebin"
+
+  cat > "$fakebin/cursor-agent" <<'EOF'
+#!/bin/bash
+printf '%s\n' '{"type":"system","subtype":"init","model":"Auto","session_id":"cursor-session-tui","permissionMode":"default"}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"text":"<ralph>COMPLETE</ralph>"}]}}'
+printf '%s\n' '{"type":"result","subtype":"success","result":"OK","session_id":"cursor-session-tui","request_id":"request-tui-123"}'
+EOF
+  chmod +x "$fakebin/cursor-agent"
+
+  (
+    export PATH="$fakebin:$PATH"
+    export MODEL=auto
+    export SCRIPT_DIR="$REPO_DIR/scripts"
+    export RALPH_TUI_ACTIVE=1
+    # shellcheck disable=SC1090
+    source "$REPO_DIR/scripts/ralph-common.sh"
+    spinner() {
+      printf '%s\n' "spinner-called" >> "$workspace/spinner.log"
+      while true; do
+        sleep 60
+      done
+    }
+    init_ralph_dir "$workspace"
+    signal="$(run_iteration "$workspace" 1 "$REPO_DIR/scripts")"
+    [[ "$signal" == "COMPLETE" ]]
+  ) >/dev/null 2>"$workspace/run.stderr"
+
+  if [[ -f "$workspace/spinner.log" ]]; then
+    echo "Assertion failed: CLI spinner should not run while TUI mode is active" >&2
+    exit 1
+  fi
+}
+
 run_signal_timeline_case() {
   local workspace
   workspace="$(make_workspace)"
@@ -549,12 +587,22 @@ complete_state = ns["load_dashboard_state"](complete_workspace)
 assert not complete_state.is_complete, complete_state
 
 old_epoch = 946684800
-for rel_path in (".ralph/activity.log", ".ralph/.last-session.env", ".ralph/signals.log"):
+for rel_path in (
+    ".ralph/runtime.env",
+    ".ralph/.last-session.env",
+    ".ralph/activity.log",
+    ".ralph/progress.md",
+    ".ralph/signals.log",
+    ".ralph/errors.log",
+    ".ralph/tui-run.log",
+):
     path = stale_workspace / rel_path
-    os.utime(path, (old_epoch, old_epoch))
+    if path.exists():
+        os.utime(path, (old_epoch, old_epoch))
 
 stale_state = ns["load_dashboard_state"](stale_workspace)
 assert stale_state.is_stale, stale_state
+assert stale_state.freshness_source in {"runtime", "session", "activity", "progress", "signals", "errors", "console"}, stale_state
 PY
 }
 
@@ -603,6 +651,12 @@ state = ns["load_dashboard_state"](workspace)
 assert len(state.task_items) == 3, state.task_items
 assert state.task_items[1].label == "Dashboard shows current task state", state.task_items
 assert state.signal_items[-1].signal == "WARN", state.signal_items
+assert state.freshness_source, state
+
+frame, label, color = ns["dashboard_activity_indicator"](state, 0)
+assert frame in ns["DASHBOARD_SPINNER_FRAMES"], frame
+assert label.startswith("active via "), label
+assert color == "#ffd166", color
 PY
 }
 
@@ -686,6 +740,7 @@ PY
   run_auto_model_case
   run_live_abort_case
   run_auto_policy_violation_case
+  run_tui_spinner_suppression_case
   run_stop_helper_case
   run_parser_session_metadata_case
   run_navigation_brief_case
