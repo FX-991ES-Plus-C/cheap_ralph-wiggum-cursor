@@ -896,46 +896,40 @@ assistant_has_standalone_sigil() {
   printf '%s\n' "$text" | grep -Eq "^[[:space:]]*${sigil}[[:space:]]*$"
 }
 
-tool_call_interaction_key() {
+tool_call_id() {
   local line="$1"
   local call_id
-  local args_key
 
-  call_id=$(echo "$line" | jq -r '.call_id // empty' 2>/dev/null) || call_id=""
-  if [[ -n "$call_id" ]]; then
-    printf 'id:%s\n' "$call_id"
-    return 0
-  fi
-
-  args_key=$(echo "$line" | jq -c '
-    if .tool_call.readToolCall then
-      {readToolCall:{args:(.tool_call.readToolCall.args // {})}}
-    elif .tool_call.writeToolCall then
-      {writeToolCall:{args:(.tool_call.writeToolCall.args // {})}}
-    elif .tool_call.shellToolCall then
-      {shellToolCall:{args:(.tool_call.shellToolCall.args // {})}}
-    else
-      {}
-    end
-  ' 2>/dev/null) || args_key=""
-
-  if [[ -n "$args_key" ]] && [[ "$args_key" != "{}" ]]; then
-    printf 'args:%s\n' "$args_key"
+  call_id=$(echo "$line" | jq -r '.call_id // .callId // .tool_call.call_id // .tool_call.callId // empty' 2>/dev/null) || call_id=""
+  if [[ -n "$call_id" ]] && [[ "$call_id" != "null" ]]; then
+    printf '%s\n' "$call_id"
   fi
 }
 
 record_tool_interaction() {
-  local key="$1"
+  local subtype="$1"
+  local call_id="$2"
 
-  [[ -n "$key" ]] || return 1
+  if [[ -n "$call_id" ]]; then
+    local key="id:$call_id"
+    if grep -Fxq -- "$key" "$TOOL_INTERACTIONS_FILE" 2>/dev/null; then
+      return 1
+    fi
 
-  if grep -Fxq -- "$key" "$TOOL_INTERACTIONS_FILE" 2>/dev/null; then
-    return 1
+    printf '%s\n' "$key" >> "$TOOL_INTERACTIONS_FILE"
+    TOOL_CALLS=$((TOOL_CALLS + 1))
+    return 0
   fi
 
-  printf '%s\n' "$key" >> "$TOOL_INTERACTIONS_FILE"
-  TOOL_CALLS=$((TOOL_CALLS + 1))
-  return 0
+  # Anonymous tool calls often repeat the same args across legitimate rereads.
+  # Count each completed event rather than deduping by args, or the dashboard
+  # under-reports tool usage whenever the agent retries an identical action.
+  if [[ "$subtype" == "completed" ]]; then
+    TOOL_CALLS=$((TOOL_CALLS + 1))
+    return 0
+  fi
+
+  return 1
 }
 
 # Process a single JSON line from stream
@@ -1086,13 +1080,9 @@ process_line() {
       
     "tool_call")
       if [[ "$subtype" == "started" ]] || [[ "$subtype" == "completed" ]]; then
-        local tool_key=""
-        tool_key=$(tool_call_interaction_key "$line") || tool_key=""
-        if [[ -n "$tool_key" ]]; then
-          record_tool_interaction "$tool_key" || true
-        elif [[ "$subtype" == "completed" ]]; then
-          TOOL_CALLS=$((TOOL_CALLS + 1))
-        fi
+        local tool_call_id_value=""
+        tool_call_id_value=$(tool_call_id "$line") || tool_call_id_value=""
+        record_tool_interaction "$subtype" "$tool_call_id_value" || true
       fi
 
       if [[ "$subtype" == "completed" ]]; then

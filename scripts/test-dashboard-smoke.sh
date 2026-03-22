@@ -79,7 +79,7 @@ RALPH_SESSION_BYTES_READ=0
 RALPH_SESSION_BYTES_WRITTEN=0
 RALPH_SESSION_ASSISTANT_CHARS=0
 RALPH_SESSION_SHELL_OUTPUT_CHARS=0
-RALPH_SESSION_TOOL_CALLS=0
+RALPH_SESSION_TOOL_CALLS=1
 RALPH_SESSION_READ_CALLS=1
 RALPH_SESSION_WRITE_CALLS=0
 RALPH_SESSION_WORK_WRITE_CALLS=0
@@ -172,6 +172,17 @@ run_tool_interaction_counter_case() {
   assert_contains "$dedupe_workspace/.ralph/.last-session.env" "RALPH_SESSION_TOOL_CALLS=1"
   assert_contains "$dedupe_workspace/.ralph/.last-session.env" "RALPH_SESSION_READ_CALLS=1"
   assert_contains "$dedupe_workspace/.ralph/.last-session.env" "RALPH_SESSION_TOOL_OVERHEAD_TOKENS=12"
+
+  local repeated_workspace
+  repeated_workspace="$(make_workspace)"
+  printf '%s\n' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/demo.ts"},"result":{"success":{"totalLines":50,"contentSize":1800}}}}}' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/demo.ts"},"result":{"success":{"totalLines":50,"contentSize":1800}}}}}' \
+    | WARN_THRESHOLD=999999 ROTATE_THRESHOLD=999999 bash "$REPO_DIR/scripts/stream-parser.sh" "$repeated_workspace" >"$repeated_workspace/parser.out"
+
+  assert_contains "$repeated_workspace/.ralph/.last-session.env" "RALPH_SESSION_TOOL_CALLS=2"
+  assert_contains "$repeated_workspace/.ralph/.last-session.env" "RALPH_SESSION_READ_CALLS=2"
+  assert_contains "$repeated_workspace/.ralph/.last-session.env" "RALPH_SESSION_TOOL_OVERHEAD_TOKENS=24"
 }
 
 run_live_metric_flush_case() {
@@ -905,6 +916,69 @@ assert stale_state.freshness_source in {"runtime", "session", "activity", "progr
 PY
 }
 
+run_mission_control_indicator_case() {
+  local stopped_workspace thrash_workspace
+  stopped_workspace="$(make_workspace)"
+  thrash_workspace="$(make_workspace)"
+
+  cat > "$stopped_workspace/.ralph/runtime.env" <<'EOF'
+# Ralph runtime state
+RALPH_RUNTIME_STATUS=stopped
+RALPH_RUNTIME_ITERATION=1
+RALPH_RUNTIME_MODEL=test-model
+RALPH_RUNTIME_LAST_SIGNAL=STOPPED
+RALPH_RUNTIME_LAST_EVENT=Stopped\ from\ smoke\ test
+RALPH_RUNTIME_MODE=loop
+RALPH_RUNTIME_AGENT_PID=
+RALPH_RUNTIME_UPDATED_AT=2026-03-19\ 12:00:00\ EDT
+EOF
+
+  cat > "$stopped_workspace/.ralph/signals.log" <<'EOF'
+# Signal Log
+
+[2026-03-19 12:00:05] source=dashboard iteration=1 signal=STOPPED | Stopped from smoke test
+EOF
+
+  cat > "$thrash_workspace/.ralph/runtime.env" <<'EOF'
+# Ralph runtime state
+RALPH_RUNTIME_STATUS=thrash
+RALPH_RUNTIME_ITERATION=1
+RALPH_RUNTIME_MODEL=test-model
+RALPH_RUNTIME_LAST_SIGNAL=THRASH
+RALPH_RUNTIME_LAST_EVENT=Loop\ halted\ after\ repeated\ thrash\ rotations
+RALPH_RUNTIME_MODE=loop
+RALPH_RUNTIME_AGENT_PID=
+RALPH_RUNTIME_UPDATED_AT=2026-03-19\ 12:00:00\ EDT
+EOF
+
+  cat > "$thrash_workspace/.ralph/signals.log" <<'EOF'
+# Signal Log
+
+[2026-03-19 12:00:02] source=loop iteration=1 signal=THRASH | Loop halted after repeated rotate-without-progress sessions
+[2026-03-19 12:00:03] source=loop iteration=? signal=THRASH_RECOVERY_EXHAUSTED | consecutive_no_progress=3 limit=2
+EOF
+
+  python3 - "$REPO_DIR/scripts/ralph-tui.py" "$stopped_workspace" "$thrash_workspace" <<'PY'
+import runpy
+import sys
+from pathlib import Path
+
+ns = runpy.run_path(sys.argv[1], run_name="ralph_tui_test")
+stopped_state = ns["load_dashboard_state"](Path(sys.argv[2]))
+thrash_state = ns["load_dashboard_state"](Path(sys.argv[3]))
+
+assert ns["display_signal_name"](stopped_state) == "STOPPED", stopped_state
+assert ns["mood_snapshot"](stopped_state) == ("-_-", "parked and ready", "#90e0ef"), stopped_state
+assert ns["dashboard_activity_indicator"](stopped_state, 0) == ("■", "stopped", "#90e0ef"), stopped_state
+assert ns["format_freshness"](stopped_state).startswith("last update via "), stopped_state
+
+assert ns["display_signal_name"](thrash_state) == "THRASH_RECOVERY_EXHAUSTED", thrash_state
+assert ns["mood_snapshot"](thrash_state) == ("x_x", "thrash recovery exhausted", "#e76f51"), thrash_state
+assert ns["dashboard_activity_indicator"](thrash_state, 0) == ("●", "recovery exhausted", "#e76f51"), thrash_state
+assert ns["format_freshness"](thrash_state).startswith("last update via "), thrash_state
+PY
+}
+
 run_command_helper_case() {
   local workspace
   workspace="$(make_workspace)"
@@ -971,7 +1045,8 @@ main() {
   assert_contains "$snapshot_file" "Timeline:"
   assert_contains "$snapshot_file" "Cursor: session cursor-session-123 | req request-456 | perm default"
   assert_contains "$snapshot_file" "Model: test-model"
-  assert_contains "$snapshot_file" "Telemetry: reads 1 (0B)  writes 0 (0B)  shell 0  tools 0"
+  assert_contains "$snapshot_file" "Telemetry: reads 1 (0B)  writes 0 (0B)  shell 0  tools 1"
+  assert_contains "$snapshot_file" "Token Mix: prompt 480, read 120, write 60, assist 90, shell 10, tools 12"
   assert_contains "$snapshot_file" "Hot file: src/demo.ts x2 (4.0KB, 120 lines)"
   assert_contains "$snapshot_file" "Sources:"
   assert_contains "$snapshot_file" "- Signals: WARN"
@@ -1057,6 +1132,7 @@ PY
   run_thrash_recovery_exhaustion_case
   run_signal_timeline_case
   run_dashboard_state_logic_case
+  run_mission_control_indicator_case
   run_command_helper_case
 
   echo "dashboard smoke test passed"

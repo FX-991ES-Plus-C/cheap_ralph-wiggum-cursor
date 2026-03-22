@@ -64,10 +64,13 @@ KNOWN_SIGNAL_MARKERS = (
     "SESSION_START",
     "LOOP_COMPLETE",
     "LOOP_START",
+    "STOPPED",
     "COMPLETE",
     "ROTATE",
     "GUTTER",
     "THRASH",
+    "THRASH_RECOVERY",
+    "THRASH_RECOVERY_EXHAUSTED",
     "DEFER",
     "ABORT",
     "WARN",
@@ -85,6 +88,9 @@ SIGNAL_STYLES = {
     "SESSION_START": "bold #8ecae6",
     "LOOP_START": "bold #8ecae6",
     "LOOP_COMPLETE": "bold #2a9d8f",
+    "STOPPED": "bold #90e0ef",
+    "THRASH_RECOVERY": "bold #f4a261",
+    "THRASH_RECOVERY_EXHAUSTED": "bold #e76f51",
 }
 DEFAULT_SIGNAL_STYLE = "bold #8ecae6"
 EMPTY_STATE_HINTS = {
@@ -303,6 +309,10 @@ def format_count(value: int) -> str:
     if number >= 1_000:
         return f"{number / 1_000:.1f}k"
     return str(number)
+
+
+def format_chars(value: int) -> str:
+    return f"{format_count(value)} chars"
 
 
 def format_age(seconds: int | None) -> str:
@@ -783,6 +793,36 @@ def recent_signal_timeline(lines: list[str]) -> list[str]:
     return timeline[-6:]
 
 
+def display_signal_name(state: DashboardState) -> str:
+    runtime_signal = state.runtime.get("RALPH_RUNTIME_LAST_SIGNAL", "NONE").strip().upper() or "NONE"
+    latest_signal = ""
+    if state.latest_signals:
+        latest_signal = signal_from_line(state.latest_signals[-1]) or ""
+        latest_signal = latest_signal.upper()
+
+    if runtime_signal in {"", "NONE"}:
+        if latest_signal in {
+            "STOPPED",
+            "COMPLETE",
+            "ROTATE",
+            "GUTTER",
+            "THRASH",
+            "THRASH_RECOVERY",
+            "THRASH_RECOVERY_EXHAUSTED",
+            "DEFER",
+            "ABORT",
+            "WARN",
+            "MAX_ITERATIONS",
+        }:
+            return latest_signal
+        return runtime_signal
+
+    if runtime_signal == "THRASH" and latest_signal in {"THRASH_RECOVERY", "THRASH_RECOVERY_EXHAUSTED"}:
+        return latest_signal
+
+    return runtime_signal
+
+
 def signal_items_from_lines(lines: list[str]) -> list[SignalSidebarItem]:
     items: list[SignalSidebarItem] = []
     for raw_line, line in enumerate(lines):
@@ -862,6 +902,27 @@ def token_mix_rows(telemetry: SessionTelemetry) -> list[tuple[str, int]]:
     ]
 
 
+def token_mix_summary(telemetry: SessionTelemetry, *, compact: bool = False) -> str:
+    short_labels = {
+        "Prompt": "p",
+        "Read": "r",
+        "Write": "w",
+        "Assist": "a",
+        "Shell": "sh",
+        "Tools": "t",
+    }
+    parts = [
+        (
+            f"{short_labels[label]} {format_count(value)}"
+            if compact
+            else f"{label.lower()} {format_count(value)}"
+        )
+        for label, value in token_mix_rows(telemetry)
+        if value > 0
+    ]
+    return "  ".join(parts) if compact else ", ".join(parts)
+
+
 def feedback_preview_for_view(view_name: str, state: DashboardState) -> str:
     view_state = state.views[view_name]
     if view_name == "tasks":
@@ -893,7 +954,7 @@ def feedback_pulse_for_view(view_name: str, state: DashboardState) -> str:
             return "no criteria"
         return f"{state.done_count}/{state.total_count} done"
     if view_name == "signals":
-        return state.runtime["RALPH_RUNTIME_LAST_SIGNAL"]
+        return display_signal_name(state)
     if view_name == "errors":
         preview = latest_content_line(view_state.body, predicate=errorish_line)
         return "attention" if preview else "clear"
@@ -925,14 +986,19 @@ def build_feedback_sources(state: DashboardState) -> list[FeedbackSource]:
 
 
 def mood_snapshot(state: DashboardState) -> tuple[str, str, str]:
-    last_signal = state.runtime["RALPH_RUNTIME_LAST_SIGNAL"].upper()
+    status = state.runtime.get("RALPH_RUNTIME_STATUS", "").lower()
+    last_signal = display_signal_name(state)
     if state.is_complete:
         return "\\o/", "mission accomplished", "#2a9d8f"
+    if status == "stopped" or last_signal == "STOPPED":
+        return "-_-", "parked and ready", "#90e0ef"
+    if last_signal == "THRASH_RECOVERY_EXHAUSTED":
+        return "x_x", "thrash recovery exhausted", "#e76f51"
     if state.is_stale:
         return "-_-", "waiting for fresh log crumbs", "#e76f51"
-    if last_signal == "ABORT":
+    if status in {"error", "abort", "aborted"} or last_signal == "ABORT":
         return "x_x", "hit a hard stop and needs help", "#e76f51"
-    if last_signal == "THRASH":
+    if status == "thrash" or last_signal == "THRASH":
         return "@_@", "spinning without enough progress", "#e76f51"
     if last_signal == "MAX_ITERATIONS":
         return ":/", "out of planned passes", "#e76f51"
@@ -944,6 +1010,8 @@ def mood_snapshot(state: DashboardState) -> tuple[str, str, str]:
         return "<:>", "squeezed but still on mission", "#90e0ef"
     if last_signal == "DEFER":
         return "x_x", "taking a beat before another pass", "#e76f51"
+    if last_signal == "THRASH_RECOVERY":
+        return "<o>", "taking another swing with fresh context", "#f4a261"
     if state.health_label == "SPICY":
         return "<o>", "token volcano but under control", "#f4a261"
     return "\\o/", "turbo wiggle", "#ffd166"
@@ -954,26 +1022,35 @@ def format_freshness(state: DashboardState) -> str:
         return "idle"
     source = FRESHNESS_LABELS.get(state.freshness_source, state.freshness_source or "Activity")
     if state.is_stale:
-        return f"STALE for {state.stale_seconds}s"
-    return f"fresh via {source} {format_age(state.stale_seconds)} ago"
+        return f"STALE via {source} for {state.stale_seconds}s"
+    if state.runtime.get("RALPH_RUNTIME_STATUS", "").lower() in ACTIVE_RUNTIME_STATUSES:
+        return f"fresh via {source} {format_age(state.stale_seconds)} ago"
+    return f"last update via {source} {format_age(state.stale_seconds)} ago"
 
 
 def dashboard_activity_indicator(state: DashboardState, tick: int) -> tuple[str, str, str]:
     status = state.runtime.get("RALPH_RUNTIME_STATUS", "").lower()
+    last_signal = display_signal_name(state)
     source = FRESHNESS_LABELS.get(state.freshness_source, state.freshness_source or "Activity").lower()
 
     if state.is_complete or status in {"complete", "completed", "done"}:
         return "●", "complete", "#2a9d8f"
+    if last_signal == "THRASH_RECOVERY_EXHAUSTED":
+        return "●", "recovery exhausted", "#e76f51"
+    if status == "thrash" or last_signal == "THRASH":
+        return "●", "thrash stop", "#e76f51"
     if status in ACTIVE_RUNTIME_STATUSES:
         if state.is_stale:
             return "○", "waiting for fresh movement", "#e76f51"
         frame = DASHBOARD_SPINNER_FRAMES[tick % len(DASHBOARD_SPINNER_FRAMES)]
+        if last_signal == "THRASH_RECOVERY":
+            return frame, f"recovering via {source}", "#f4a261"
         return frame, f"active via {source}", "#ffd166"
     if status in {"deferred"}:
         return "◌", "deferred", "#f4a261"
     if status in {"error", "abort", "aborted"}:
         return "●", "needs attention", "#e76f51"
-    if status in {"stopped"}:
+    if status in {"stopped"} or last_signal == "STOPPED":
         return "■", "stopped", "#90e0ef"
     return "·", "idle", "#90e0ef"
 
@@ -983,8 +1060,6 @@ def staleness_snapshot(
     heartbeat_sources: list[tuple[str, Path | None]],
 ) -> tuple[int | None, bool, str]:
     status = runtime.get("RALPH_RUNTIME_STATUS", "").lower()
-    if status not in {"running", "starting", "rotating", "gutter", "loop", "looping"}:
-        return None, False, ""
 
     freshest_candidates: list[tuple[datetime, str]] = []
     if runtime_timestamp := parse_runtime_timestamp(runtime.get("RALPH_RUNTIME_UPDATED_AT", "")):
@@ -1000,7 +1075,8 @@ def staleness_snapshot(
 
     updated_at, source_name = max(freshest_candidates, key=lambda item: item[0])
     age_seconds = max(int((datetime.now() - updated_at).total_seconds()), 0)
-    return age_seconds, age_seconds >= STALE_AFTER_SECONDS, source_name
+    is_active = status in ACTIVE_RUNTIME_STATUSES
+    return age_seconds, is_active and age_seconds >= STALE_AFTER_SECONDS, source_name
 
 
 def load_dashboard_state(workspace: Path) -> DashboardState:
@@ -1166,8 +1242,8 @@ def render_progress_bar(done_count: int, total_count: int, width: int = 20) -> s
 
 def render_snapshot(state: DashboardState) -> str:
     telemetry = current_session_telemetry(state)
-    token_rows = token_mix_rows(telemetry)
-    token_total = sum(value for _, value in token_rows)
+    token_summary = token_mix_summary(telemetry)
+    signal_name = display_signal_name(state)
     lines = [
         "Ralph Dashboard",
         f"Workspace: {state.workspace}",
@@ -1181,7 +1257,7 @@ def render_snapshot(state: DashboardState) -> str:
         f"Cursor: {cursor_session_summary(state)}",
         (
             "Signal: "
-            f"{state.runtime['RALPH_RUNTIME_LAST_SIGNAL']}  "
+            f"{signal_name}  "
             f"Event: {state.runtime['RALPH_RUNTIME_LAST_EVENT']}"
         ),
         (
@@ -1211,14 +1287,7 @@ def render_snapshot(state: DashboardState) -> str:
                 else "none"
             )
         ),
-        "Token Mix: "
-        + ", ".join(
-            f"{label.lower()} {value}/{token_total or 1}"
-            for label, value in token_rows
-            if value > 0
-        )
-        if token_total > 0
-        else "Token Mix: waiting for session telemetry",
+        "Token Mix: " + token_summary if token_summary else "Token Mix: waiting for session telemetry",
         f"Timeline: {' > '.join(state.signal_timeline)}",
         (
             "Freshness: "
@@ -2826,6 +2895,8 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             mascot, mood, mood_color = mood_snapshot(state)
             freshness = format_freshness(state)
             pulse_frame, pulse_label, pulse_color = dashboard_activity_indicator(state, self.tick)
+            signal_name = display_signal_name(state)
+            signal_style = SIGNAL_STYLES.get(signal_name, DEFAULT_SIGNAL_STYLE)
             progress_bar = render_progress_bar(state.done_count, state.total_count, width=18)
             layout = (
                 f"buddy {VIEW_LABELS[self.current_companion_view()].lower()}"
@@ -2850,6 +2921,7 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                     style="#f7f4ea",
                     overflow="ellipsis",
                 ),
+                Text(f"Signal: {signal_name}", style=signal_style),
                 Text.assemble(
                     ("Live: ", "#f7f4ea"),
                     (pulse_frame, f"bold {pulse_color}"),
@@ -2904,7 +2976,7 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             )
             telemetry_table.add_row(
                 "Shell",
-                f"{telemetry.shell_calls} / {format_bytes(telemetry.shell_output_chars)}",
+                f"{telemetry.shell_calls} / {format_chars(telemetry.shell_output_chars)}",
             )
             telemetry_table.add_row(
                 "Tools",
@@ -2912,15 +2984,11 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
             )
             telemetry_table.add_row(
                 "Assistant",
-                f"{format_bytes(telemetry.assistant_chars)} / {format_count(telemetry.assistant_tokens)} tok",
+                f"{format_chars(telemetry.assistant_chars)} / {format_count(telemetry.assistant_tokens)} tok",
             )
             telemetry_table.add_row(
                 "Token mix",
-                (
-                    f"read {format_count(telemetry.read_tokens)}  "
-                    f"write {format_count(telemetry.write_tokens)}  "
-                    f"shell {format_count(telemetry.shell_tokens)}"
-                ),
+                token_mix_summary(telemetry, compact=True) or "waiting",
             )
             if telemetry.hot_file:
                 telemetry_table.add_row(
