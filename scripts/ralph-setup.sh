@@ -40,52 +40,9 @@ fi
 # GUM UI HELPERS
 # =============================================================================
 
-# Model options
-MODELS=(
-  "auto"
-  "opus-4.5-thinking"
-  "sonnet-4.5-thinking"
-  "gpt-5.2-high"
-  "composer-1"
-  "Custom..."
-)
-
-# Select model using gum or fallback
+# Select model. Ralph is locked to Cursor Auto mode.
 select_model() {
-  if [[ "$HAS_GUM" == "true" ]]; then
-    local selected
-    selected=$(gum choose --header "Select model:" "${MODELS[@]}")
-    
-    if [[ "$selected" == "Custom..." ]]; then
-      selected=$(gum input --placeholder "Enter model name" --value "$DEFAULT_MODEL")
-    fi
-    echo "$selected"
-  else
-    echo ""
-    echo "Select model:"
-    local i=1
-    for m in "${MODELS[@]}"; do
-      if [[ "$m" == "Custom..." ]]; then
-        echo "  $i) Custom (enter manually)"
-      else
-        echo "  $i) $m"
-      fi
-      ((i++))
-    done
-    echo ""
-    read -p "Choice [1]: " choice
-    choice="${choice:-1}"
-    
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#MODELS[@]} ]]; then
-      local selected="${MODELS[$((choice-1))]}"
-      if [[ "$selected" == "Custom..." ]]; then
-        read -p "Enter model name: " selected
-      fi
-      echo "$selected"
-    else
-      echo "${MODELS[0]}"
-    fi
-  fi
+  echo "auto"
 }
 
 # Get max iterations using gum or fallback
@@ -261,7 +218,7 @@ main() {
   
   # 1. Select model
   MODEL=$(select_model)
-  echo "✓ Model: $MODEL"
+  echo "✓ Model: auto (required)"
   
   # 2. Max iterations
   MAX_ITERATIONS=$(get_max_iterations)
@@ -325,7 +282,7 @@ main() {
   
   echo "─────────────────────────────────────────────────────────────────"
   echo "Summary:"
-  echo "  • Model:      $MODEL"
+  echo "  • Model:      auto (required)"
   echo "  • Iterations: $MAX_ITERATIONS max"
   [[ -n "$USE_BRANCH" ]] && echo "  • Branch:     $USE_BRANCH"
   [[ "$OPEN_PR" == "true" ]] && echo "  • Open PR:    Yes"
@@ -474,7 +431,7 @@ main() {
     exit $?
   else
     # Run full sequential loop
-    run_ralph_loop "$workspace" "$SCRIPT_DIR"
+    run_ralph_loop_with_recovery "$workspace" "$SCRIPT_DIR"
     exit $?
   fi
 }

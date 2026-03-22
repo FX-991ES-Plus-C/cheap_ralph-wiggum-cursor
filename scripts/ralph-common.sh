@@ -40,9 +40,12 @@ ACTIVITY_ROTATE_MAX_LINES="${ACTIVITY_ROTATE_MAX_LINES:-2500}"
 # Anti-thrash / self-management
 LARGE_READ_THRESHOLD_BYTES="${LARGE_READ_THRESHOLD_BYTES:-81920}"
 VERY_LARGE_READ_THRESHOLD_BYTES="${VERY_LARGE_READ_THRESHOLD_BYTES:-262144}"
+MAX_VERY_LARGE_REREADS_PER_FILE="${MAX_VERY_LARGE_REREADS_PER_FILE:-3}"
 MAX_LARGE_REREADS_PER_FILE="${MAX_LARGE_REREADS_PER_FILE:-3}"
 MAX_LARGE_READS_WITHOUT_WRITE="${MAX_LARGE_READS_WITHOUT_WRITE:-5}"
-MAX_THRASH_ROTATIONS="${MAX_THRASH_ROTATIONS:-3}"
+MAX_THRASH_ROTATIONS="${MAX_THRASH_ROTATIONS:-4}"
+MAX_CONSECUTIVE_THRASH_RECOVERIES="${MAX_CONSECUTIVE_THRASH_RECOVERIES:-2}"
+THRASH_RECOVERY_DELAY_SECONDS="${THRASH_RECOVERY_DELAY_SECONDS:-3}"
 SESSION_BRIEF_MAX_DIRTY_FILES="${SESSION_BRIEF_MAX_DIRTY_FILES:-8}"
 SESSION_BRIEF_MAX_ERROR_LINES="${SESSION_BRIEF_MAX_ERROR_LINES:-6}"
 SESSION_BRIEF_MAX_LARGE_FILES="${SESSION_BRIEF_MAX_LARGE_FILES:-8}"
@@ -2441,6 +2444,7 @@ run_iteration() {
   (
     export LARGE_READ_THRESHOLD_BYTES="$LARGE_READ_THRESHOLD_BYTES"
     export VERY_LARGE_READ_THRESHOLD_BYTES="$VERY_LARGE_READ_THRESHOLD_BYTES"
+    export MAX_VERY_LARGE_REREADS_PER_FILE="$MAX_VERY_LARGE_REREADS_PER_FILE"
     export MAX_LARGE_REREADS_PER_FILE="$MAX_LARGE_REREADS_PER_FILE"
     export MAX_LARGE_READS_WITHOUT_WRITE="$MAX_LARGE_READS_WITHOUT_WRITE"
     export RALPH_ITERATION="$iteration"
@@ -2566,8 +2570,15 @@ run_ralph_loop() {
   local workspace="$1"
   local script_dir="${2:-$(dirname "${BASH_SOURCE[0]}")}"
 
-  require_auto_model "$MODEL" || return 1
-  acquire_sequential_lock "$workspace" || return 1
+  RALPH_LOOP_FINAL_SIGNAL="NONE"
+  require_auto_model "$MODEL" || {
+    RALPH_LOOP_FINAL_SIGNAL="ABORT"
+    return 1
+  }
+  acquire_sequential_lock "$workspace" || {
+    RALPH_LOOP_FINAL_SIGNAL="ABORT"
+    return 1
+  }
   write_runtime_state "$workspace" "starting" "$(get_iteration "$workspace")" "$MODEL" "NONE" "Loop starting" "loop" ""
   append_signal_event "$workspace" "LOOP_START" "max_iterations=$MAX_ITERATIONS model=$MODEL" "loop" "$(get_iteration "$workspace")"
   
@@ -2644,6 +2655,7 @@ run_ralph_loop() {
       echo "Check git log for detailed history."
       append_signal_event "$workspace" "LOOP_COMPLETE" "All criteria satisfied" "loop" "$iteration"
       write_runtime_state "$workspace" "complete" "$iteration" "$MODEL" "COMPLETE" "All criteria satisfied" "loop" ""
+      RALPH_LOOP_FINAL_SIGNAL="COMPLETE"
       
       # Open PR if requested
       if [[ "$OPEN_PR" == "true" ]] && [[ -n "$USE_BRANCH" ]]; then
@@ -2675,6 +2687,7 @@ run_ralph_loop() {
           echo "Check git log for detailed history."
           append_signal_event "$workspace" "LOOP_COMPLETE" "Agent signaled completion and criteria verified" "loop" "$iteration"
           write_runtime_state "$workspace" "complete" "$iteration" "$MODEL" "COMPLETE" "Agent signaled completion and criteria verified" "loop" ""
+          RALPH_LOOP_FINAL_SIGNAL="COMPLETE"
           
           # Open PR if requested
           if [[ "$OPEN_PR" == "true" ]] && [[ -n "$USE_BRANCH" ]]; then
@@ -2727,6 +2740,7 @@ run_ralph_loop() {
         log_error "$workspace" "🚨 THRASH STOP: Ralph halted after $thrash_rotation_streak rotate-without-progress iterations"
         append_signal_event "$workspace" "THRASH" "Loop halted after repeated rotate-without-progress sessions" "loop" "$iteration"
         write_runtime_state "$workspace" "thrash" "$iteration" "$MODEL" "THRASH" "Loop halted after repeated thrash rotations" "loop" ""
+        RALPH_LOOP_FINAL_SIGNAL="THRASH"
         echo ""
         echo "🚨 Ralph detected repeated large-file reread thrash without meaningful progress."
         echo "   Check .ralph/errors.log for the rotate streak details, tighten the task scope,"
@@ -2758,6 +2772,7 @@ run_ralph_loop() {
         log_progress "$workspace" "**Session $iteration ended** - ❌ Agent launch/runtime failure"
         append_signal_event "$workspace" "ABORT" "Agent launch/runtime failure" "loop" "$iteration"
         write_runtime_state "$workspace" "error" "$iteration" "$MODEL" "ABORT" "Agent launch/runtime failure" "loop" ""
+        RALPH_LOOP_FINAL_SIGNAL="ABORT"
         echo ""
         echo "❌ Ralph could not start or keep the agent running."
         echo "   Check .ralph/errors.log and .ralph/activity.log for the raw failure."
@@ -2784,10 +2799,77 @@ run_ralph_loop() {
   log_progress "$workspace" "**Loop ended** - ⚠️ Max iterations ($MAX_ITERATIONS) reached"
   append_signal_event "$workspace" "MAX_ITERATIONS" "Loop ended after $MAX_ITERATIONS iterations" "loop" "$MAX_ITERATIONS"
   write_runtime_state "$workspace" "idle" "$MAX_ITERATIONS" "$MODEL" "MAX_ITERATIONS" "Max iterations reached" "loop" ""
+  RALPH_LOOP_FINAL_SIGNAL="MAX_ITERATIONS"
   echo ""
   echo "⚠️  Max iterations ($MAX_ITERATIONS) reached."
   echo "   Task may not be complete. Check progress manually."
   return 1
+}
+
+run_ralph_loop_with_recovery() {
+  local workspace="$1"
+  local script_dir="${2:-$(dirname "${BASH_SOURCE[0]}")}"
+  local thrash_recovery_streak=0
+  local total_restarts=0
+
+  while true; do
+    local head_before criteria_before done_before
+    head_before=$(get_git_head)
+    criteria_before=$(count_criteria "$workspace")
+    done_before="${criteria_before%%:*}"
+    DEFER_COUNT=0
+
+    local loop_rc=0
+    if run_ralph_loop "$workspace" "$script_dir"; then
+      return 0
+    else
+      loop_rc=$?
+    fi
+
+    local final_signal="${RALPH_LOOP_FINAL_SIGNAL:-NONE}"
+    local head_after criteria_after done_after
+    head_after=$(get_git_head)
+    criteria_after=$(count_criteria "$workspace")
+    done_after="${criteria_after%%:*}"
+
+    local progress_made=0
+    if [[ "$head_before" != "$head_after" ]] || [[ "$done_after" -gt "$done_before" ]]; then
+      progress_made=1
+    fi
+
+    if [[ "$final_signal" != "THRASH" ]] || [[ "${MAX_CONSECUTIVE_THRASH_RECOVERIES:-0}" -le 0 ]]; then
+      return "$loop_rc"
+    fi
+
+    if [[ $progress_made -eq 1 ]]; then
+      thrash_recovery_streak=0
+    else
+      thrash_recovery_streak=$((thrash_recovery_streak + 1))
+    fi
+
+    if [[ $thrash_recovery_streak -gt $MAX_CONSECUTIVE_THRASH_RECOVERIES ]]; then
+      log_error "$workspace" "🚫 THRASH RECOVERY EXHAUSTED: ${thrash_recovery_streak} consecutive no-progress loop batches hit the limit (${MAX_CONSECUTIVE_THRASH_RECOVERIES})"
+      append_signal_event "$workspace" "THRASH_RECOVERY_EXHAUSTED" "consecutive_no_progress=$thrash_recovery_streak limit=$MAX_CONSECUTIVE_THRASH_RECOVERIES" "loop" ""
+      return "$loop_rc"
+    fi
+
+    total_restarts=$((total_restarts + 1))
+    log_progress "$workspace" "**Loop restart** - 🔁 THRASH recovery ($total_restarts total restarts)"
+    log_error "$workspace" "🔁 THRASH RECOVERY: restarting full loop after THRASH STOP (restart $total_restarts, progress_made=$progress_made, consecutive_no_progress=$thrash_recovery_streak/$MAX_CONSECUTIVE_THRASH_RECOVERIES)"
+    append_signal_event "$workspace" "THRASH_RECOVERY" "restart=$total_restarts progress_made=$progress_made consecutive_no_progress=$thrash_recovery_streak limit=$MAX_CONSECUTIVE_THRASH_RECOVERIES" "loop" ""
+    write_runtime_state "$workspace" "starting" "$(get_iteration "$workspace")" "$MODEL" "THRASH_RECOVERY" "Restarting loop after thrash stop" "loop" ""
+    echo ""
+    echo "🔁 Restarting Ralph with a fresh top-level loop after THRASH STOP."
+    if [[ $progress_made -eq 1 ]]; then
+      echo "   The previous loop batch still made progress, so the no-progress recovery streak has been reset."
+    else
+      echo "   Consecutive no-progress thrash batches: $thrash_recovery_streak / $MAX_CONSECUTIVE_THRASH_RECOVERIES"
+    fi
+    if [[ "${THRASH_RECOVERY_DELAY_SECONDS:-0}" -gt 0 ]]; then
+      echo "   Waiting ${THRASH_RECOVERY_DELAY_SECONDS}s before restarting..."
+      sleep "$THRASH_RECOVERY_DELAY_SECONDS"
+    fi
+  done
 }
 
 # =============================================================================

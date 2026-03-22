@@ -9,13 +9,13 @@
 # Usage:
 #   ./ralph-loop.sh                              # Start from current directory
 #   ./ralph-loop.sh /path/to/project             # Start from specific project
-#   ./ralph-loop.sh -n 50 -m gpt-5.2-high        # Custom iterations and model
+#   ./ralph-loop.sh -n 50 -m auto                # Custom iterations in auto mode
 #   ./ralph-loop.sh --branch feature/foo --pr   # Create branch and PR
 #   ./ralph-loop.sh -y                           # Skip confirmation (for scripting)
 #
 # Flags:
 #   -n, --iterations N     Max iterations (default: 20)
-#   -m, --model MODEL      Model to use (default: auto)
+#   -m, --model MODEL      Model to use (must be: auto)
 #   --branch NAME          Sequential: create/work on branch; Parallel: integration branch name
 #   --pr                   Sequential: open PR (requires --branch); Parallel: open ONE integration PR (branch optional)
 #   --parallel             Run tasks in parallel with worktrees
@@ -56,7 +56,7 @@ Usage:
 
 Options:
   -n, --iterations N     Max iterations (default: 20)
-  -m, --model MODEL      Model to use (default: auto)
+  -m, --model MODEL      Model to use (must be: auto)
   --branch NAME          Sequential: create/work on branch; Parallel: integration branch name
   --pr                   Sequential: open PR (requires --branch); Parallel: open ONE integration PR (branch optional)
   --parallel             Run tasks in parallel with worktrees
@@ -69,13 +69,17 @@ Options:
 Examples:
   ./ralph-loop.sh                                    # Interactive mode
   ./ralph-loop.sh -n 50                              # 50 iterations max
-  ./ralph-loop.sh -m gpt-5.2-high                    # Use GPT model
+  ./ralph-loop.sh -m auto                            # Explicitly request Cursor Auto
   ./ralph-loop.sh --branch feature/api --pr -y      # Scripted PR workflow
   ./ralph-loop.sh --parallel --max-parallel 4        # Run 4 agents in parallel
   ./ralph-loop.sh --dashboard -y                     # Launch with live dashboard
   
 Environment:
-  RALPH_MODEL            Override default model (same as -m flag)
+  RALPH_MODEL            Override default model (must be: auto)
+  MAX_CONSECUTIVE_THRASH_RECOVERIES
+                         Auto-restart full loop after THRASH STOP (default: 2)
+  THRASH_RECOVERY_DELAY_SECONDS
+                         Pause before a fresh-loop restart (default: 3)
 
 For interactive setup with a beautiful UI, use ralph-setup.sh instead.
 EOF
@@ -160,6 +164,10 @@ main() {
     WORKSPACE="$(cd "$WORKSPACE" && pwd)"
   fi
 
+  if ! require_auto_model "$MODEL"; then
+    exit 1
+  fi
+
   if [[ "$DASHBOARD_MODE" == "true" ]] && [[ "${RALPH_TUI_ACTIVE:-0}" != "1" ]]; then
     init_ralph_dir "$WORKSPACE"
     write_runtime_state "$WORKSPACE" "starting" "$(get_iteration "$WORKSPACE")" "$MODEL" "NONE" "Dashboard launching" "loop" ""
@@ -217,7 +225,7 @@ main() {
   remaining=$((total_criteria - done_criteria))
   
   echo "Progress: $done_criteria / $total_criteria criteria complete ($remaining remaining)"
-  echo "Model:    $MODEL"
+  echo "Model:    $(format_requested_model_label "$MODEL")"
   echo "Max iter: $MAX_ITERATIONS"
   [[ -n "$USE_BRANCH" ]] && echo "Branch:   $USE_BRANCH"
   [[ "$OPEN_PR" == "true" ]] && echo "Open PR:  Yes"
@@ -270,7 +278,7 @@ main() {
     exit $?
   else
     # Run the sequential loop
-    run_ralph_loop "$WORKSPACE" "$SCRIPT_DIR"
+    run_ralph_loop_with_recovery "$WORKSPACE" "$SCRIPT_DIR"
     exit $?
   fi
 }

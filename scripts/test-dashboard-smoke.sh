@@ -209,6 +209,206 @@ run_live_metric_flush_case() {
   rm -f "$fifo"
 }
 
+run_large_reread_threshold_case() {
+  local very_large_safe_workspace very_large_gutter_workspace
+  local large_safe_workspace large_gutter_workspace
+
+  very_large_safe_workspace="$(make_workspace)"
+  printf '%s\n' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/huge.ts"},"result":{"success":{"totalLines":3200,"contentSize":300000}}}}}' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/huge.ts"},"result":{"success":{"totalLines":3200,"contentSize":300000}}}}}' \
+    | WARN_THRESHOLD=999999 ROTATE_THRESHOLD=999999 bash "$REPO_DIR/scripts/stream-parser.sh" "$very_large_safe_workspace" >"$very_large_safe_workspace/parser.out"
+
+  assert_not_contains "$very_large_safe_workspace/.ralph/signals.log" "signal=GUTTER"
+  assert_contains "$very_large_safe_workspace/.ralph/.last-session.env" "RALPH_SESSION_SIGNAL=NONE"
+
+  very_large_gutter_workspace="$(make_workspace)"
+  printf '%s\n' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/huge.ts"},"result":{"success":{"totalLines":3200,"contentSize":300000}}}}}' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/huge.ts"},"result":{"success":{"totalLines":3200,"contentSize":300000}}}}}' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/huge.ts"},"result":{"success":{"totalLines":3200,"contentSize":300000}}}}}' \
+    | WARN_THRESHOLD=999999 ROTATE_THRESHOLD=999999 bash "$REPO_DIR/scripts/stream-parser.sh" "$very_large_gutter_workspace" >"$very_large_gutter_workspace/parser.out"
+
+  assert_contains "$very_large_gutter_workspace/parser.out" "GUTTER"
+  assert_contains "$very_large_gutter_workspace/.ralph/signals.log" "very large file reread of src/huge.ts (3x before any write)"
+
+  large_safe_workspace="$(make_workspace)"
+  printf '%s\n' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/large.ts"},"result":{"success":{"totalLines":1400,"contentSize":120000}}}}}' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/large.ts"},"result":{"success":{"totalLines":1400,"contentSize":120000}}}}}' \
+    | WARN_THRESHOLD=999999 ROTATE_THRESHOLD=999999 bash "$REPO_DIR/scripts/stream-parser.sh" "$large_safe_workspace" >"$large_safe_workspace/parser.out"
+
+  assert_not_contains "$large_safe_workspace/.ralph/signals.log" "signal=GUTTER"
+  assert_contains "$large_safe_workspace/.ralph/.last-session.env" "RALPH_SESSION_SIGNAL=NONE"
+
+  large_gutter_workspace="$(make_workspace)"
+  printf '%s\n' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/large.ts"},"result":{"success":{"totalLines":1400,"contentSize":120000}}}}}' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/large.ts"},"result":{"success":{"totalLines":1400,"contentSize":120000}}}}}' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/large.ts"},"result":{"success":{"totalLines":1400,"contentSize":120000}}}}}' \
+    | WARN_THRESHOLD=999999 ROTATE_THRESHOLD=999999 bash "$REPO_DIR/scripts/stream-parser.sh" "$large_gutter_workspace" >"$large_gutter_workspace/parser.out"
+
+  assert_contains "$large_gutter_workspace/parser.out" "GUTTER"
+  assert_contains "$large_gutter_workspace/.ralph/signals.log" "repeated large reread of src/large.ts (3x before any write)"
+}
+
+run_thrash_rotation_tolerance_case() {
+  local workspace status
+  workspace="$(make_workspace)"
+  : > "$workspace/.ralph/errors.log"
+
+  set +e
+  (
+    export SCRIPT_DIR="$REPO_DIR/scripts"
+    export MODEL=auto
+    export MAX_ITERATIONS=10
+    # shellcheck disable=SC1090
+    source "$REPO_DIR/scripts/ralph-common.sh"
+
+    acquire_sequential_lock() { return 0; }
+    release_sequential_lock() { return 0; }
+    write_runtime_state() { :; }
+    append_signal_event() { :; }
+    log_progress() { :; }
+    log_error() {
+      local file_workspace="$1"
+      local message="$2"
+      printf '%s\n' "$message" >> "$file_workspace/.ralph/errors.log"
+    }
+    count_criteria() { echo "0:3"; }
+    check_task_complete() { echo "INCOMPLETE"; }
+    get_git_head() { echo "fake-head"; }
+    session_work_edit_calls_total() { echo 0; }
+    run_iteration() {
+      local file_workspace="$1"
+      cat > "$file_workspace/.ralph/.last-session.env" <<'EOF'
+RALPH_SESSION_LARGE_READ_THRASH_HIT=1
+RALPH_SESSION_LARGE_READ_REREADS=3
+RALPH_SESSION_LARGE_READS=4
+RALPH_SESSION_WORK_EDIT_CALLS=0
+RALPH_SESSION_SHELL_WORK_EDIT_CALLS=0
+RALPH_SESSION_WORK_WRITE_CALLS=0
+EOF
+      echo "ROTATE"
+    }
+
+    run_ralph_loop "$workspace" "$REPO_DIR/scripts"
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+
+  if [[ $status -ne 1 ]]; then
+    echo "Assertion failed: expected run_ralph_loop to stop with THRASH" >&2
+    exit 1
+  fi
+
+  assert_contains "$workspace/.ralph/errors.log" "streak 4"
+  assert_contains "$workspace/.ralph/errors.log" "halted after 4 rotate-without-progress iterations"
+  assert_not_contains "$workspace/.ralph/errors.log" "halted after 3 rotate-without-progress iterations"
+}
+
+run_thrash_recovery_supervisor_case() {
+  local workspace status
+  workspace="$(make_workspace)"
+
+  set +e
+  (
+    export SCRIPT_DIR="$REPO_DIR/scripts"
+    export MODEL=auto
+    export MAX_CONSECUTIVE_THRASH_RECOVERIES=2
+    export THRASH_RECOVERY_DELAY_SECONDS=0
+    # shellcheck disable=SC1090
+    source "$REPO_DIR/scripts/ralph-common.sh"
+    init_ralph_dir "$workspace"
+
+    loop_calls=0
+    current_head="head-0"
+    current_done=0
+
+    sleep() { :; }
+    get_git_head() { echo "$current_head"; }
+    count_criteria() { echo "${current_done}:5"; }
+    run_ralph_loop() {
+      loop_calls=$((loop_calls + 1))
+      case "$loop_calls" in
+        1)
+          RALPH_LOOP_FINAL_SIGNAL="THRASH"
+          return 1
+          ;;
+        2)
+          current_head="head-1"
+          current_done=1
+          RALPH_LOOP_FINAL_SIGNAL="THRASH"
+          return 1
+          ;;
+        3)
+          current_head="head-2"
+          current_done=2
+          RALPH_LOOP_FINAL_SIGNAL="COMPLETE"
+          return 0
+          ;;
+        *)
+          RALPH_LOOP_FINAL_SIGNAL="ABORT"
+          return 1
+          ;;
+      esac
+    }
+
+    run_ralph_loop_with_recovery "$workspace" "$REPO_DIR/scripts"
+  )
+  status=$?
+  set -e
+
+  if [[ $status -ne 0 ]]; then
+    echo "Assertion failed: expected run_ralph_loop_with_recovery to recover and succeed" >&2
+    exit 1
+  fi
+
+  assert_contains "$workspace/.ralph/signals.log" "signal=THRASH_RECOVERY"
+  assert_contains "$workspace/.ralph/signals.log" "progress_made=0"
+  assert_contains "$workspace/.ralph/signals.log" "progress_made=1"
+  assert_not_contains "$workspace/.ralph/signals.log" "THRASH_RECOVERY_EXHAUSTED"
+}
+
+run_thrash_recovery_exhaustion_case() {
+  local workspace status
+  workspace="$(make_workspace)"
+
+  set +e
+  (
+    export SCRIPT_DIR="$REPO_DIR/scripts"
+    export MODEL=auto
+    export MAX_CONSECUTIVE_THRASH_RECOVERIES=2
+    export THRASH_RECOVERY_DELAY_SECONDS=0
+    # shellcheck disable=SC1090
+    source "$REPO_DIR/scripts/ralph-common.sh"
+    init_ralph_dir "$workspace"
+
+    current_head="head-0"
+    current_done=0
+
+    sleep() { :; }
+    get_git_head() { echo "$current_head"; }
+    count_criteria() { echo "${current_done}:5"; }
+    run_ralph_loop() {
+      RALPH_LOOP_FINAL_SIGNAL="THRASH"
+      return 1
+    }
+
+    run_ralph_loop_with_recovery "$workspace" "$REPO_DIR/scripts"
+  )
+  status=$?
+  set -e
+
+  if [[ $status -ne 1 ]]; then
+    echo "Assertion failed: expected run_ralph_loop_with_recovery to stop after exhausting recoveries" >&2
+    exit 1
+  fi
+
+  assert_contains "$workspace/.ralph/signals.log" "signal=THRASH_RECOVERY_EXHAUSTED"
+  assert_contains "$workspace/.ralph/errors.log" "THRASH RECOVERY EXHAUSTED"
+}
+
 run_stop_helper_case() {
   local workspace worker_pid child_pid lock_dir
   workspace="$(make_workspace)"
@@ -526,6 +726,7 @@ EOF
   printf '%s\n' \
     '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/monster.ts"},"result":{"success":{"totalLines":960,"contentSize":300000}}}}}' \
     '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/monster.ts"},"result":{"success":{"totalLines":960,"contentSize":300000}}}}}' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/monster.ts"},"result":{"success":{"totalLines":960,"contentSize":300000}}}}}' \
     | WARN_THRESHOLD=999999 ROTATE_THRESHOLD=999999 bash "$REPO_DIR/scripts/stream-parser.sh" "$workspace" >"$workspace/parser.out"
 
   assert_contains "$workspace/parser.out" "GUTTER"
@@ -797,6 +998,7 @@ PY
 
   run_tool_interaction_counter_case
   run_live_metric_flush_case
+  run_large_reread_threshold_case
 
   run_parser_case \
     "defer" \
@@ -850,6 +1052,9 @@ PY
   run_navigation_brief_case
   run_task_validation_case
   run_task_scaffolding_warning_case
+  run_thrash_rotation_tolerance_case
+  run_thrash_recovery_supervisor_case
+  run_thrash_recovery_exhaustion_case
   run_signal_timeline_case
   run_dashboard_state_logic_case
   run_command_helper_case

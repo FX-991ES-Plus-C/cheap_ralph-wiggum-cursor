@@ -578,8 +578,8 @@ The parser detects when the agent is stuck:
 |---------|---------|--------------|
 | Repeated failure | Same command failed 3x | GUTTER signal, then fresh-context rotation |
 | File thrashing | Same file written 5x in 10 min | GUTTER signal, then fresh-context rotation |
-| Large-file reread thrash | Same large file reread before any write | GUTTER signal, then fresh-context rotation |
-| Rotate-without-progress streak | Repeated rotate sessions with no useful work | THRASH STOP |
+| Large-file reread thrash | Repeated same-file large rereads before any write | GUTTER signal, then fresh-context rotation |
+| Rotate-without-progress streak | Repeated rotate sessions with no useful work | THRASH STOP, then a fresh-loop restart while recovery budget remains |
 | Agent signals | Agent outputs `<ralph>GUTTER</ralph>` | GUTTER signal, then fresh-context rotation |
 
 When gutter is detected:
@@ -588,9 +588,9 @@ When gutter is detected:
 3. Add a guardrail or tighten the task if the same issue keeps coming back
 
 When a `THRASH STOP` occurs:
-1. Check `.ralph/activity.log` and `.ralph/errors.log` for the repeated reread pattern
-2. Add or tighten a guardrail telling Ralph to use `rg -n`, `wc -l`, and `sed -n` before full-file reads
-3. Restart Ralph after adjusting the task or guardrails
+1. Ralph now tries a fresh top-level loop restart automatically by default
+2. If the repeated thrash batches are consecutive and make no net progress, Ralph eventually stops again once the recovery budget is exhausted
+3. If that happens, check `.ralph/activity.log` and `.ralph/errors.log`, then tighten the task or guardrails before rerunning
 
 ## Rate Limit & Transient Error Handling
 
@@ -658,9 +658,12 @@ MAX_ITERATIONS=20                   # Max iterations before giving up
 WARN_THRESHOLD=170000              # Tokens: send wrapup warning
 ROTATE_THRESHOLD=200000            # Tokens: force rotation
 AUTO_ROTATE_LOGS=true              # Compact live logs during long runs
+MAX_VERY_LARGE_REREADS_PER_FILE=3  # Let giant files get one more full pass before gutter
 MAX_LARGE_REREADS_PER_FILE=3       # Stop repeated large rereads
 MAX_LARGE_READS_WITHOUT_WRITE=5    # Stop discovery-only thrash
-MAX_THRASH_ROTATIONS=3             # Halt after repeated rotate-without-progress
+MAX_THRASH_ROTATIONS=4             # Halt after repeated rotate-without-progress
+MAX_CONSECUTIVE_THRASH_RECOVERIES=2 # Auto-restart after THRASH until consecutive no-progress restarts run out
+THRASH_RECOVERY_DELAY_SECONDS=3    # Brief pause before a fresh-loop restart
 ```
 
 ## Troubleshooting
