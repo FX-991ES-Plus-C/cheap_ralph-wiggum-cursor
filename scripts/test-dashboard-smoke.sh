@@ -139,6 +139,41 @@ run_parser_case() {
   assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_SIGNAL=${expected_signal}"
 }
 
+run_parser_non_terminal_sigil_reference_case() {
+  local workspace
+  workspace="$(make_workspace)"
+
+  printf '%s\n' \
+    '{"type":"assistant","message":{"content":[{"text":"Still 145 criteria remain, so do not output <ralph>COMPLETE</ralph> yet."}]}}' \
+    | WARN_THRESHOLD=999999 ROTATE_THRESHOLD=999999 bash "$REPO_DIR/scripts/stream-parser.sh" "$workspace" >"$workspace/parser.out"
+
+  assert_not_contains "$workspace/.ralph/signals.log" "signal=COMPLETE"
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_SIGNAL=NONE"
+}
+
+run_tool_interaction_counter_case() {
+  local workspace
+  local dedupe_workspace
+
+  workspace="$(make_workspace)"
+  printf '%s\n' \
+    '{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"src/demo.ts"},"result":{"success":{"totalLines":50,"contentSize":1800}}}}}' \
+    | WARN_THRESHOLD=999999 ROTATE_THRESHOLD=999999 bash "$REPO_DIR/scripts/stream-parser.sh" "$workspace" >"$workspace/parser.out"
+
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_TOOL_CALLS=1"
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_TOOL_OVERHEAD_TOKENS=12"
+
+  dedupe_workspace="$(make_workspace)"
+  printf '%s\n' \
+    '{"type":"tool_call","subtype":"started","call_id":"tool-123","tool_call":{"readToolCall":{"args":{"path":"src/demo.ts"}}}}' \
+    '{"type":"tool_call","subtype":"completed","call_id":"tool-123","tool_call":{"readToolCall":{"args":{"path":"src/demo.ts"},"result":{"success":{"totalLines":50,"contentSize":1800}}}}}' \
+    | WARN_THRESHOLD=999999 ROTATE_THRESHOLD=999999 bash "$REPO_DIR/scripts/stream-parser.sh" "$dedupe_workspace" >"$dedupe_workspace/parser.out"
+
+  assert_contains "$dedupe_workspace/.ralph/.last-session.env" "RALPH_SESSION_TOOL_CALLS=1"
+  assert_contains "$dedupe_workspace/.ralph/.last-session.env" "RALPH_SESSION_READ_CALLS=1"
+  assert_contains "$dedupe_workspace/.ralph/.last-session.env" "RALPH_SESSION_TOOL_OVERHEAD_TOKENS=12"
+}
+
 run_stop_helper_case() {
   local workspace worker_pid child_pid lock_dir
   workspace="$(make_workspace)"
@@ -718,10 +753,14 @@ PY
     "COMPLETE" \
     '{"type":"assistant","message":{"content":[{"text":"<ralph>COMPLETE</ralph>"}]}}'
 
+  run_parser_non_terminal_sigil_reference_case
+
   run_parser_case \
     "gutter" \
     "GUTTER" \
     '{"type":"assistant","message":{"content":[{"text":"<ralph>GUTTER</ralph>"}]}}'
+
+  run_tool_interaction_counter_case
 
   run_parser_case \
     "defer" \

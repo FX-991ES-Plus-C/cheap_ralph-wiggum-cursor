@@ -94,9 +94,10 @@ PROMPT_CHARS=3000
 FAILURES_FILE=$(mktemp)
 WRITES_FILE=$(mktemp)
 READS_FILE=$(mktemp)
+TOOL_INTERACTIONS_FILE=$(mktemp)
 WORKSPACE_SNAPSHOT_FILE=$(mktemp)
 WORKSPACE_SNAPSHOT_READY=0
-trap "rm -f $FAILURES_FILE $WRITES_FILE $READS_FILE $WORKSPACE_SNAPSHOT_FILE" EXIT
+trap "rm -f $FAILURES_FILE $WRITES_FILE $READS_FILE $TOOL_INTERACTIONS_FILE $WORKSPACE_SNAPSHOT_FILE" EXIT
 
 # Get context health emoji
 get_health_emoji() {
@@ -882,6 +883,55 @@ process_raw_line() {
   fi
 }
 
+assistant_has_standalone_sigil() {
+  local text="$1"
+  local sigil="$2"
+
+  printf '%s\n' "$text" | grep -Eq "^[[:space:]]*${sigil}[[:space:]]*$"
+}
+
+tool_call_interaction_key() {
+  local line="$1"
+  local call_id
+  local args_key
+
+  call_id=$(echo "$line" | jq -r '.call_id // empty' 2>/dev/null) || call_id=""
+  if [[ -n "$call_id" ]]; then
+    printf 'id:%s\n' "$call_id"
+    return 0
+  fi
+
+  args_key=$(echo "$line" | jq -c '
+    if .tool_call.readToolCall then
+      {readToolCall:{args:(.tool_call.readToolCall.args // {})}}
+    elif .tool_call.writeToolCall then
+      {writeToolCall:{args:(.tool_call.writeToolCall.args // {})}}
+    elif .tool_call.shellToolCall then
+      {shellToolCall:{args:(.tool_call.shellToolCall.args // {})}}
+    else
+      {}
+    end
+  ' 2>/dev/null) || args_key=""
+
+  if [[ -n "$args_key" ]] && [[ "$args_key" != "{}" ]]; then
+    printf 'args:%s\n' "$args_key"
+  fi
+}
+
+record_tool_interaction() {
+  local key="$1"
+
+  [[ -n "$key" ]] || return 1
+
+  if grep -Fxq -- "$key" "$TOOL_INTERACTIONS_FILE" 2>/dev/null; then
+    return 1
+  fi
+
+  printf '%s\n' "$key" >> "$TOOL_INTERACTIONS_FILE"
+  TOOL_CALLS=$((TOOL_CALLS + 1))
+  return 0
+}
+
 # Process a single JSON line from stream
 process_line() {
   local line="$1"
@@ -1003,12 +1053,12 @@ process_line() {
         TOKEN_EST_ASSISTANT=$((TOKEN_EST_ASSISTANT + assistant_tokens))
         
         # Check for completion sigil
-        if [[ "$text" == *"<ralph>COMPLETE</ralph>"* ]]; then
+        if assistant_has_standalone_sigil "$text" "<ralph>COMPLETE</ralph>"; then
           emit_signal_once "COMPLETE" "✅ Agent signaled COMPLETE"
         fi
         
         # Check for gutter sigil
-        if [[ "$text" == *"<ralph>GUTTER</ralph>"* ]]; then
+        if assistant_has_standalone_sigil "$text" "<ralph>GUTTER</ralph>"; then
           emit_signal_once "GUTTER" "🚨 Agent signaled GUTTER (stuck)"
         fi
       fi
@@ -1029,10 +1079,17 @@ process_line() {
       ;;
       
     "tool_call")
-      if [[ "$subtype" == "started" ]]; then
-        TOOL_CALLS=$((TOOL_CALLS + 1))
-        
-      elif [[ "$subtype" == "completed" ]]; then
+      if [[ "$subtype" == "started" ]] || [[ "$subtype" == "completed" ]]; then
+        local tool_key=""
+        tool_key=$(tool_call_interaction_key "$line") || tool_key=""
+        if [[ -n "$tool_key" ]]; then
+          record_tool_interaction "$tool_key" || true
+        elif [[ "$subtype" == "completed" ]]; then
+          TOOL_CALLS=$((TOOL_CALLS + 1))
+        fi
+      fi
+
+      if [[ "$subtype" == "completed" ]]; then
         # Handle read tool completion
         if echo "$line" | jq -e '.tool_call.readToolCall.result.success' > /dev/null 2>&1; then
           local path=$(echo "$line" | jq -r '.tool_call.readToolCall.args.path // "unknown"' 2>/dev/null) || path="unknown"
