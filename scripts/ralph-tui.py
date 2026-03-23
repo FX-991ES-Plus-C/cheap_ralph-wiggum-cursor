@@ -537,6 +537,15 @@ def resolved_model_label(state: DashboardState) -> str:
     return runtime_model or "unknown"
 
 
+def resolved_backend_label(state: DashboardState) -> str:
+    session = current_session_metadata(state)
+    session_backend = session.get("RALPH_SESSION_BACKEND", "").strip()
+    if session_backend:
+        return session_backend
+    runtime_backend = state.runtime.get("RALPH_RUNTIME_BACKEND", "").strip()
+    return runtime_backend or "unknown"
+
+
 def shorten_identifier(raw: str, width: int = 12) -> str:
     cleaned = raw.strip()
     if len(cleaned) <= width:
@@ -544,13 +553,16 @@ def shorten_identifier(raw: str, width: int = 12) -> str:
     return cleaned[:width]
 
 
-def cursor_session_summary(state: DashboardState) -> str:
+def agent_session_summary(state: DashboardState) -> str:
     session = current_session_metadata(state)
     session_id = session.get("RALPH_SESSION_ID", "").strip()
     request_id = session.get("RALPH_SESSION_REQUEST_ID", "").strip()
     permission_mode = session.get("RALPH_SESSION_PERMISSION_MODE", "").strip()
+    backend = resolved_backend_label(state).strip()
 
     parts: list[str] = []
+    if backend:
+        parts.append(backend)
     if session_id:
         parts.append(f"session {session_id}")
     elif state.runtime.get("RALPH_RUNTIME_STATUS", "").lower() in {
@@ -572,6 +584,10 @@ def cursor_session_summary(state: DashboardState) -> str:
     if permission_mode:
         parts.append(f"perm {permission_mode}")
     return " | ".join(parts)
+
+
+def cursor_session_summary(state: DashboardState) -> str:
+    return agent_session_summary(state)
 
 
 def health_label(token_pct: int) -> str:
@@ -1111,6 +1127,7 @@ def load_dashboard_state(workspace: Path) -> DashboardState:
     runtime_defaults = {
         "RALPH_RUNTIME_STATUS": "idle",
         "RALPH_RUNTIME_ITERATION": "0",
+        "RALPH_RUNTIME_BACKEND": "cursor",
         "RALPH_RUNTIME_MODEL": "unknown",
         "RALPH_RUNTIME_LAST_SIGNAL": "NONE",
         "RALPH_RUNTIME_LAST_EVENT": "Waiting for Ralph",
@@ -1172,6 +1189,7 @@ def build_placeholder_state(workspace: Path) -> DashboardState:
         runtime={
             "RALPH_RUNTIME_STATUS": "loading",
             "RALPH_RUNTIME_ITERATION": "0",
+            "RALPH_RUNTIME_BACKEND": "loading",
             "RALPH_RUNTIME_MODEL": "loading",
             "RALPH_RUNTIME_LAST_SIGNAL": "NONE",
             "RALPH_RUNTIME_LAST_EVENT": "Hydrating dashboard",
@@ -1254,7 +1272,7 @@ def render_snapshot(state: DashboardState) -> str:
             f"Mode: {state.runtime['RALPH_RUNTIME_MODE']}  "
             f"Model: {resolved_model_label(state)}"
         ),
-        f"Cursor: {cursor_session_summary(state)}",
+        f"Agent: {agent_session_summary(state)}",
         (
             "Signal: "
             f"{signal_name}  "
@@ -2917,7 +2935,7 @@ def launch_textual_dashboard(workspace: Path, mode: str, child_args: list[str]) 
                     style="#bde0fe",
                 ),
                 Text(
-                    "Cursor: " + cursor_session_summary(state),
+                    "Agent: " + agent_session_summary(state),
                     style="#f7f4ea",
                     overflow="ellipsis",
                 ),

@@ -24,10 +24,11 @@ if ! git rev-parse --git-dir > /dev/null 2>&1; then
   fi
 fi
 
-# Check for cursor-agent CLI
-if ! command -v cursor-agent &> /dev/null; then
-  echo "⚠️  Warning: cursor-agent CLI not found."
-  echo "   Install via: curl https://cursor.com/install -fsS | bash"
+# Check for supported agent CLIs
+if ! command -v cursor-agent &> /dev/null && ! command -v qwen &> /dev/null; then
+  echo "⚠️  Warning: no supported agent CLI found."
+  echo "   Install Cursor via: curl https://cursor.com/install -fsS | bash"
+  echo "   Install Qwen via: https://qwenlm.github.io/qwen-code-docs/en/getting-started/install/"
   echo ""
 fi
 
@@ -204,6 +205,7 @@ cat > .ralph/runtime.env << 'EOF'
 # Ralph runtime state
 RALPH_RUNTIME_STATUS=idle
 RALPH_RUNTIME_ITERATION=0
+RALPH_RUNTIME_BACKEND=cursor
 RALPH_RUNTIME_MODEL=auto
 RALPH_RUNTIME_LAST_SIGNAL=NONE
 RALPH_RUNTIME_LAST_EVENT=Waiting\ for\ Ralph

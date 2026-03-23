@@ -11,7 +11,7 @@
 # Requirements:
 #   - RALPH_TASK.md in the project root
 #   - Git repository
-#   - cursor-agent CLI installed
+#   - supported agent CLI installed (`cursor-agent` or `qwen`)
 #   - gum (optional, for enhanced UI): brew install gum
 
 set -euo pipefail
@@ -40,9 +40,36 @@ fi
 # GUM UI HELPERS
 # =============================================================================
 
-# Select model. Ralph is locked to Cursor Auto mode.
+# Select model. Ralph is currently locked to backend-default auto mode.
 select_model() {
   echo "auto"
+}
+
+select_agent_backend() {
+  local current_backend="${1:-${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}}"
+  current_backend="$(normalize_backend_name "$current_backend")"
+
+  if [[ "$HAS_GUM" == "true" ]]; then
+    local selected
+    selected=$(gum choose --header "Agent backend:" "cursor" "qwen") || selected="$current_backend"
+    echo "${selected:-$current_backend}"
+  else
+    echo "Agent backend:"
+    echo "  1) cursor"
+    echo "  2) qwen"
+    read -p "Choose backend [${current_backend}]: " choice
+    case "$choice" in
+      2|"qwen"|"Qwen")
+        echo "qwen"
+        ;;
+      ""|1|"cursor"|"Cursor")
+        echo "${current_backend:-cursor}"
+        ;;
+      *)
+        echo "${current_backend:-cursor}"
+        ;;
+    esac
+  fi
 }
 
 # Get max iterations using gum or fallback
@@ -150,6 +177,25 @@ show_header() {
 # MAIN
 # =============================================================================
 
+WORKSPACE_ARG="."
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --agent-backend)
+      AGENT_BACKEND="$2"
+      shift 2
+      ;;
+    -h|--help)
+      echo "Usage: $0 [--agent-backend cursor|qwen] [workspace]"
+      exit 0
+      ;;
+    *)
+      WORKSPACE_ARG="$1"
+      shift
+      ;;
+  esac
+done
+
 main() {
   local workspace="${1:-.}"
   if [[ "$workspace" == "." ]]; then
@@ -171,7 +217,25 @@ main() {
   fi
   echo ""
   
-  # Check prerequisites
+  # ==========================================================================
+  # INTERACTIVE SETUP
+  # ==========================================================================
+  
+  echo ""
+  if [[ "$HAS_GUM" == "true" ]]; then
+    gum style --foreground 212 "Configure your Ralph session:"
+  else
+    echo "Configure your Ralph session:"
+  fi
+  echo ""
+
+  AGENT_BACKEND=$(select_agent_backend "${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}")
+  if ! require_supported_backend "$AGENT_BACKEND"; then
+    exit 1
+  fi
+  echo "✓ Backend: $(format_backend_label "$AGENT_BACKEND")"
+
+  # Check prerequisites after backend selection
   if ! check_prerequisites "$workspace"; then
     exit 1
   fi
@@ -203,18 +267,6 @@ main() {
     echo "🎉 Task already complete! All criteria are checked."
     exit 0
   fi
-  
-  # ==========================================================================
-  # INTERACTIVE SETUP
-  # ==========================================================================
-  
-  echo ""
-  if [[ "$HAS_GUM" == "true" ]]; then
-    gum style --foreground 212 "Configure your Ralph session:"
-  else
-    echo "Configure your Ralph session:"
-  fi
-  echo ""
   
   # 1. Select model
   MODEL=$(select_model)
@@ -282,6 +334,7 @@ main() {
   
   echo "─────────────────────────────────────────────────────────────────"
   echo "Summary:"
+  echo "  • Backend:    $(format_backend_label "$AGENT_BACKEND")"
   echo "  • Model:      auto (required)"
   echo "  • Iterations: $MAX_ITERATIONS max"
   [[ -n "$USE_BRANCH" ]] && echo "  • Branch:     $USE_BRANCH"
@@ -307,13 +360,14 @@ main() {
   
   # Export settings for the loop
   export MODEL
+  export AGENT_BACKEND
   export MAX_ITERATIONS
   export USE_BRANCH
   export OPEN_PR
 
   if [[ "$dashboard_mode" == "true" ]] && [[ "$run_single_first" != "true" ]]; then
     local -a dashboard_args
-    dashboard_args=(--dashboard -n "$MAX_ITERATIONS" -m "$MODEL" -y)
+    dashboard_args=(--dashboard -n "$MAX_ITERATIONS" -m "$MODEL" --agent-backend "$AGENT_BACKEND" -y)
     [[ -n "$USE_BRANCH" ]] && dashboard_args+=(--branch "$USE_BRANCH")
     [[ "$OPEN_PR" == "true" ]] && dashboard_args+=(--pr)
     if [[ "$parallel_mode" == "true" ]]; then
@@ -420,6 +474,7 @@ main() {
     
     # Export settings for parallel execution
     export MODEL
+    export AGENT_BACKEND
     export SKIP_MERGE=false
     export CREATE_PR="$OPEN_PR"
 
@@ -436,4 +491,4 @@ main() {
   fi
 }
 
-main "$@"
+main "$WORKSPACE_ARG"

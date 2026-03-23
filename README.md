@@ -1,6 +1,6 @@
-# Ralph Wiggum for Cursor
+# Ralph Wiggum for Cursor and Qwen
 
-An implementation of [Geoffrey Huntley's Ralph Wiggum technique](https://ghuntley.com/ralph/) for Cursor, enabling autonomous AI development with deliberate context management and stronger scaffolding for weaker, cheaper models.
+An implementation of [Geoffrey Huntley's Ralph Wiggum technique](https://ghuntley.com/ralph/) for headless agent CLIs such as Cursor and Qwen, enabling autonomous AI development with deliberate context management and stronger scaffolding for weaker, cheaper models.
 
 > "That's the beauty of Ralph - the technique is deterministically bad in an undeterministic world."
 
@@ -41,13 +41,16 @@ This creates two problems:
 │              ┌────────────┴────────────┐                    │
 │              ▼                         ▼                    │
 │         [gum UI]                  [fallback]                │
-│     Model selection            Simple prompts               │
+│  Backend + model selection     Simple prompts               │
 │     Max iterations                                          │
 │     Options (branch, PR)                                    │
 │              │                         │                    │
 │              └────────────┬────────────┘                    │
 │                           ▼                                  │
-│    cursor-agent -p --force --output-format stream-json       │
+│  cursor-agent / qwen --output-format stream-json             │
+│                           │                                  │
+│                           ▼                                  │
+│                 agent-normalizer.sh                          │
 │                           │                                  │
 │                           ▼                                  │
 │                   stream-parser.sh                           │
@@ -68,7 +71,7 @@ This creates two problems:
 ```
 
 **Key features:**
-- **Interactive setup** - Beautiful gum-based UI for model selection and options
+- **Interactive setup** - Beautiful gum-based UI for backend selection, model mode, and options
 - **FUN live dashboard** - Lightweight fullscreen TUI for activity, progress, tasks, errors, and signal history
 - **Cheap-model handoff** - Auto-generates `.ralph/session-brief.md` so each new iteration starts from a curated working set instead of rediscovering context
 - **Smarter token tracking** - Parser weights reads, writes, assistant output, shell output, and tool-call overhead instead of using a flat chars/4 guess
@@ -97,7 +100,7 @@ This version makes restart state explicit and portable:
 | Requirement | Check | How to Set Up |
 |-------------|-------|---------------|
 | **Git repo** | `git status` works | `git init` |
-| **cursor-agent CLI** | `which cursor-agent` | `curl https://cursor.com/install -fsS \| bash` |
+| **Supported agent CLI** | `which cursor-agent` or `which qwen` | Cursor: `curl https://cursor.com/install -fsS \| bash` or Qwen: [install docs](https://qwenlm.github.io/qwen-code-docs/en/getting-started/install/) |
 | **gum** (optional) | `which gum` | Installer offers to install, or `brew install gum` |
 | **python3 + textual** (dashboard only) | `python3 -c "import textual"` | Installer offers to install, or `python3 -m pip install textual` |
 
@@ -119,6 +122,7 @@ your-project/
 │   ├── ralph-once.sh           # Single iteration (testing)
 │   ├── ralph-tui.py            # Textual live dashboard / monitor
 │   ├── ralph-parallel.sh       # Parallel execution with worktrees
+│   ├── agent-normalizer.sh     # Backend event normalization
 │   ├── stream-parser.sh        # Token tracking + error detection
 │   ├── ralph-common.sh         # Shared functions
 │   ├── ralph-retry.sh          # Exponential backoff retry logic
@@ -144,9 +148,10 @@ The installer will offer to install gum automatically. You can also:
 - Skip the prompt and auto-install: `curl ... | INSTALL_GUM=1 bash`
 - Install manually: `brew install gum` (macOS) or see [gum installation](https://github.com/charmbracelet/gum#installation)
 
-With gum, you get a beautiful interactive menu for iterations and options. Ralph is intentionally locked to Cursor Auto mode:
+With gum, you get a beautiful interactive menu for backend selection, iterations, and options. Ralph is intentionally locked to backend-default `auto` mode:
 
 ```
+? Agent backend: cursor
 ? Max iterations: 20
 
 ? Options:
@@ -211,8 +216,8 @@ Keep each checkbox atomic and objectively verifiable, and keep manual approval/b
 ```
 
 Ralph will:
-1. Show interactive UI for model and options (or simple prompts if gum not installed)
-2. Run `cursor-agent` with your task
+1. Show interactive UI for backend, model mode, and options (or simple prompts if gum not installed)
+2. Run the selected agent backend with your task
 3. Parse output in real-time, tracking token usage
 4. Generate `.ralph/session-brief.md` before each iteration so the next agent starts from a curated handoff
 5. At 170k tokens: warn agent to wrap up current work
@@ -284,6 +289,7 @@ cat .ralph/errors.log
 Options:
   -n, --iterations N     Max iterations (default: 20)
   -m, --model MODEL      Model to use (must be: auto)
+  --agent-backend NAME   Agent backend to use: cursor or qwen
   --branch NAME          Sequential: create/work on branch; Parallel: integration branch name
   --pr                   Sequential: open PR (requires --branch); Parallel: open ONE integration PR (branch optional)
   --parallel             Run tasks in parallel with worktrees
@@ -298,8 +304,11 @@ Options:
 # Scripted PR workflow
 ./ralph-loop.sh --branch feature/api --pr -y
 
-# Explicitly request Cursor Auto with more iterations
+# Explicitly request backend auto mode with more iterations
 ./ralph-loop.sh -n 50 -m auto
+
+# Run Ralph with Qwen
+./ralph-loop.sh --agent-backend qwen -y
 
 # Run 4 agents in parallel
 ./ralph-loop.sh --parallel --max-parallel 4
@@ -482,7 +491,7 @@ Each parallel run creates a run directory:
 ```
 .ralph/parallel/<run_id>/
 ├── manifest.tsv                # job_id -> task_id -> branch -> status -> log
-└── jobN.log                    # full cursor-agent output for that job
+└── jobN.log                    # full agent CLI output for that job
 ```
 
 Agents are instructed to write a committed per-agent report (to avoid `.ralph/progress.md` merge conflicts):
@@ -645,11 +654,15 @@ Configuration is set via command-line flags or environment variables:
 
 ```bash
 # Via flags (recommended)
-./ralph-loop.sh -n 50 -m auto
+./ralph-loop.sh -n 50 -m auto --agent-backend cursor
 
 # Via environment
-RALPH_MODEL=auto MAX_ITERATIONS=50 ./ralph-loop.sh
+RALPH_MODEL=auto RALPH_AGENT_BACKEND=qwen MAX_ITERATIONS=50 ./ralph-loop.sh
 ```
+
+`auto` means "backend default":
+- Cursor: Cursor resolves the concrete model
+- Qwen: Qwen uses its default model unless you explicitly extend Ralph later
 
 Default thresholds in `ralph-common.sh`:
 
@@ -668,10 +681,14 @@ THRASH_RECOVERY_DELAY_SECONDS=3    # Brief pause before a fresh-loop restart
 
 ## Troubleshooting
 
-### "cursor-agent CLI not found"
+### "Supported agent CLI not found"
 
 ```bash
+# Cursor
 curl https://cursor.com/install -fsS | bash
+
+# Qwen
+# See: https://qwenlm.github.io/qwen-code-docs/en/getting-started/install/
 ```
 
 ### Agent keeps failing on same thing
@@ -723,12 +740,13 @@ Check if criteria are too vague. Each criterion should be:
 - [Original Ralph technique](https://ghuntley.com/ralph/) - Geoffrey Huntley
 - [Context as memory](https://ghuntley.com/allocations/) - The malloc/free metaphor
 - [Cursor CLI docs](https://cursor.com/docs/cli/headless)
+- [Qwen Code docs](https://qwenlm.github.io/qwen-code-docs/en/users/features/headless/)
 - [gum - A tool for glamorous shell scripts](https://github.com/charmbracelet/gum)
 
 ## Credits
 
 - **Original technique**: [Geoffrey Huntley](https://ghuntley.com/ralph/) - the Ralph Wiggum methodology
-- **Cursor port**: [Agrim Singh](https://x.com/agrimsingh) - this implementation
+- **Initial implementation**: [Agrim Singh](https://x.com/agrimsingh) - this implementation
 
 ## License
 

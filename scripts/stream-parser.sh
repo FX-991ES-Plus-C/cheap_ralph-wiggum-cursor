@@ -78,6 +78,7 @@ TOKEN_EST_READ=0
 TOKEN_EST_WRITE=0
 TOKEN_EST_ASSISTANT=0
 TOKEN_EST_SHELL=0
+SESSION_BACKEND="${RALPH_AGENT_BACKEND:-cursor}"
 CURSOR_SESSION_ID=""
 CURSOR_REQUEST_ID=""
 CURSOR_PERMISSION_MODE=""
@@ -825,6 +826,7 @@ write_session_metrics() {
 
   {
     printf 'RALPH_SESSION_ITERATION=%q\n' "${RALPH_ITERATION:-0}"
+    printf 'RALPH_SESSION_BACKEND=%q\n' "$SESSION_BACKEND"
     printf 'RALPH_SESSION_ID=%q\n' "$CURSOR_SESSION_ID"
     printf 'RALPH_SESSION_REQUEST_ID=%q\n' "$CURSOR_REQUEST_ID"
     printf 'RALPH_SESSION_PERMISSION_MODE=%q\n' "$CURSOR_PERMISSION_MODE"
@@ -932,6 +934,28 @@ record_tool_interaction() {
   return 1
 }
 
+process_assistant_text() {
+  local text="$1"
+
+  if [[ -z "$text" ]]; then
+    return
+  fi
+
+  local chars=${#text}
+  ASSISTANT_CHARS=$((ASSISTANT_CHARS + chars))
+  local assistant_tokens
+  assistant_tokens=$(estimate_assistant_tokens "$chars" "$text")
+  TOKEN_EST_ASSISTANT=$((TOKEN_EST_ASSISTANT + assistant_tokens))
+
+  if assistant_has_standalone_sigil "$text" "<ralph>COMPLETE</ralph>"; then
+    emit_signal_once "COMPLETE" "✅ Agent signaled COMPLETE"
+  fi
+
+  if assistant_has_standalone_sigil "$text" "<ralph>GUTTER</ralph>"; then
+    emit_signal_once "GUTTER" "🚨 Agent signaled GUTTER (stuck)"
+  fi
+}
+
 # Process a single JSON line from stream
 process_line() {
   local line="$1"
@@ -946,6 +970,11 @@ process_line() {
     return
   fi
   local subtype=$(echo "$line" | jq -r '.subtype // empty' 2>/dev/null) || true
+  local backend
+  backend=$(echo "$line" | jq -r '.backend // empty' 2>/dev/null) || backend=""
+  if [[ -z "$backend" ]]; then
+    backend="${SESSION_BACKEND:-${RALPH_AGENT_BACKEND:-cursor}}"
+  fi
   
   case "$type" in
     "system")
@@ -958,11 +987,12 @@ process_line() {
         model_normalized=$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]')
         local session_id=$(echo "$line" | jq -r '.session_id // .sessionId // .chatId // empty' 2>/dev/null) || session_id=""
         local permission_mode=$(echo "$line" | jq -r '.permissionMode // .permission_mode // empty' 2>/dev/null) || permission_mode=""
+        SESSION_BACKEND="$backend"
         if [[ "$requested_model_normalized" == "auto" ]]; then
-          if [[ "$model_normalized" == *"auto"* ]]; then
+          if [[ "$SESSION_BACKEND" == "cursor" ]] && [[ "$model_normalized" == *"auto"* ]]; then
             model="auto"
             model_normalized="auto"
-          else
+          elif [[ "$SESSION_BACKEND" == "cursor" ]]; then
             CURSOR_MODEL="$model"
             RALPH_MODEL_RUNTIME="$model"
             if [[ -n "$session_id" ]]; then
@@ -1008,6 +1038,13 @@ process_line() {
               signal_detail="permission=$CURSOR_PERMISSION_MODE"
             fi
           fi
+          if [[ -n "$SESSION_BACKEND" ]] && [[ "$SESSION_BACKEND" != "cursor" ]]; then
+            if [[ -n "$signal_detail" ]]; then
+              signal_detail="$signal_detail backend=$SESSION_BACKEND"
+            else
+              signal_detail="backend=$SESSION_BACKEND"
+            fi
+          fi
           if [[ -n "$requested_model" ]] && [[ "$requested_model" != "unknown" ]] && [[ "$requested_model" != "$model" ]]; then
             if [[ -n "$signal_detail" ]]; then
               signal_detail="$signal_detail requested_model=$requested_model"
@@ -1018,7 +1055,7 @@ process_line() {
           log_signal_event "SESSION_START" "$signal_detail"
           SESSION_START_SENT=1
         fi
-        if [[ -n "$model" ]] && [[ "$model" != "unknown" ]] && [[ "$model" != "$requested_model" ]]; then
+        if [[ "$SESSION_BACKEND" == "cursor" ]] && [[ -n "$model" ]] && [[ "$model" != "unknown" ]] && [[ "$model" != "$requested_model" ]]; then
           echo "Cursor resolved model: $model" >&2
         fi
         write_session_metrics
@@ -1042,32 +1079,24 @@ process_line() {
       fi
       ;;
       
+    "assistant_text")
+      local normalized_text
+      normalized_text=$(echo "$line" | jq -r '.text // empty' 2>/dev/null) || normalized_text=""
+      process_assistant_text "$normalized_text"
+      ;;
+
     "assistant")
       # Track assistant message characters
-      local text=$(echo "$line" | jq -r '.message.content[0].text // empty' 2>/dev/null) || text=""
-      if [[ -n "$text" ]]; then
-        local chars=${#text}
-        ASSISTANT_CHARS=$((ASSISTANT_CHARS + chars))
-        local assistant_tokens
-        assistant_tokens=$(estimate_assistant_tokens "$chars" "$text")
-        TOKEN_EST_ASSISTANT=$((TOKEN_EST_ASSISTANT + assistant_tokens))
-        
-        # Check for completion sigil
-        if assistant_has_standalone_sigil "$text" "<ralph>COMPLETE</ralph>"; then
-          emit_signal_once "COMPLETE" "✅ Agent signaled COMPLETE"
-        fi
-        
-        # Check for gutter sigil
-        if assistant_has_standalone_sigil "$text" "<ralph>GUTTER</ralph>"; then
-          emit_signal_once "GUTTER" "🚨 Agent signaled GUTTER (stuck)"
-        fi
-      fi
+      local text
+      text=$(echo "$line" | jq -r '[.message.content[]? | .text // empty] | join("")' 2>/dev/null) || text=""
+      process_assistant_text "$text"
       ;;
 
     "result")
       local session_id=$(echo "$line" | jq -r '.session_id // .sessionId // .chatId // empty' 2>/dev/null) || session_id=""
       local request_id=$(echo "$line" | jq -r '.request_id // .requestId // empty' 2>/dev/null) || request_id=""
       local duration=$(echo "$line" | jq -r '.duration_ms // 0' 2>/dev/null) || duration=0
+      SESSION_BACKEND="$backend"
       if [[ -n "$session_id" ]]; then
         CURSOR_SESSION_ID="$session_id"
       fi
@@ -1086,96 +1115,185 @@ process_line() {
       fi
 
       if [[ "$subtype" == "completed" ]]; then
-        # Handle read tool completion
-        if echo "$line" | jq -e '.tool_call.readToolCall.result.success' > /dev/null 2>&1; then
-          local path=$(echo "$line" | jq -r '.tool_call.readToolCall.args.path // "unknown"' 2>/dev/null) || path="unknown"
-          local lines=$(echo "$line" | jq -r '.tool_call.readToolCall.result.success.totalLines // 0' 2>/dev/null) || lines=0
-          
-          local content_size=$(echo "$line" | jq -r '.tool_call.readToolCall.result.success.contentSize // 0' 2>/dev/null) || content_size=0
-          local bytes
-          if [[ $content_size -gt 0 ]]; then
-            bytes=$content_size
-          else
-            bytes=$((lines * 100))  # ~100 chars/line for code
-          fi
-          BYTES_READ=$((BYTES_READ + bytes))
-          local read_tokens
-          read_tokens=$(estimate_read_tokens "$bytes" "$lines")
-          TOKEN_EST_READ=$((TOKEN_EST_READ + read_tokens))
-          
-          local kb=$(echo "scale=1; $bytes / 1024" | bc 2>/dev/null || echo "$((bytes / 1024))")
-          log_activity "READ $path ($lines lines, ~${kb}KB, ~${read_tokens} tok)"
-          track_file_read "$path" "$bytes" "$lines"
-          
-        # Handle write tool completion
-        elif echo "$line" | jq -e '.tool_call.writeToolCall.result.success' > /dev/null 2>&1; then
-          local path=$(echo "$line" | jq -r '.tool_call.writeToolCall.args.path // "unknown"' 2>/dev/null) || path="unknown"
-          local lines=$(echo "$line" | jq -r '.tool_call.writeToolCall.result.success.linesCreated // 0' 2>/dev/null) || lines=0
-          local bytes=$(echo "$line" | jq -r '.tool_call.writeToolCall.result.success.fileSize // 0' 2>/dev/null) || bytes=0
-          BYTES_WRITTEN=$((BYTES_WRITTEN + bytes))
-          WRITE_CALLS=$((WRITE_CALLS + 1))
-          local write_tokens
-          write_tokens=$(estimate_write_tokens "$bytes" "$lines")
-          TOKEN_EST_WRITE=$((TOKEN_EST_WRITE + write_tokens))
-          if [[ "$path" != "$RALPH_DIR/"* ]] && [[ "$path" != ".ralph/"* ]]; then
-            WORK_WRITE_CALLS=$((WORK_WRITE_CALLS + 1))
-          fi
-          
-          local kb=$(echo "scale=1; $bytes / 1024" | bc 2>/dev/null || echo "$((bytes / 1024))")
-          log_activity "WRITE $path ($lines lines, ${kb}KB, ~${write_tokens} tok)"
-          
-          # Track for thrashing detection
-          track_file_write "$path"
-          update_workspace_snapshot_entry "$path"
-          
-        # Handle shell tool completion
-        elif echo "$line" | jq -e '.tool_call.shellToolCall.result' > /dev/null 2>&1; then
-          local cmd=$(echo "$line" | jq -r '.tool_call.shellToolCall.args.command // "unknown"' 2>/dev/null) || cmd="unknown"
-          local exit_code=$(echo "$line" | jq -r '.tool_call.shellToolCall.result.exitCode // 0' 2>/dev/null) || exit_code=0
-          SHELL_CALLS=$((SHELL_CALLS + 1))
-          
-          local stdout=$(echo "$line" | jq -r '.tool_call.shellToolCall.result.stdout // ""' 2>/dev/null) || stdout=""
-          local stderr=$(echo "$line" | jq -r '.tool_call.shellToolCall.result.stderr // ""' 2>/dev/null) || stderr=""
-          local output_chars=$((${#stdout} + ${#stderr}))
-          SHELL_OUTPUT_CHARS=$((SHELL_OUTPUT_CHARS + output_chars))
-          local output_lines=0
-          if [[ -n "$stdout$stderr" ]]; then
-            output_lines=$(printf '%s' "$stdout$stderr" | awk 'END { print NR+0 }')
-          fi
-          local shell_tokens
-          shell_tokens=$(estimate_shell_tokens "$output_chars" "$output_lines")
-          TOKEN_EST_SHELL=$((TOKEN_EST_SHELL + shell_tokens))
-          track_shell_edits "$cmd" "$exit_code"
-          local shell_edit_count="$LAST_SHELL_EDIT_COUNT"
-          local shell_work_edit_seen="$LAST_SHELL_WORK_EDIT_SEEN"
-          local shell_edit_bytes="$LAST_SHELL_EDIT_BYTES"
-          local shell_edit_tokens="$LAST_SHELL_EDIT_TOKENS"
-          
-          if [[ $exit_code -eq 0 ]]; then
-            if [[ $output_chars -gt 1024 ]]; then
-              log_activity "SHELL $cmd → exit 0 (${output_chars} chars, ~${shell_tokens} tok)"
-            else
-              log_activity "SHELL $cmd → exit 0 (~${shell_tokens} tok)"
-            fi
-          else
-            log_activity "SHELL $cmd → exit $exit_code (~${shell_tokens} tok)"
-            track_shell_failure "$cmd" "$exit_code"
-          fi
+        local normalized_tool_kind
+        normalized_tool_kind=$(echo "$line" | jq -r '.tool_kind // empty' 2>/dev/null) || normalized_tool_kind=""
 
-          if [[ "${shell_edit_count:-0}" -gt 0 ]]; then
-            local edit_summary="${shell_edit_count} file"
-            if [[ "${shell_edit_count:-0}" -ne 1 ]]; then
-              edit_summary="${shell_edit_count} files"
+        if [[ -n "$normalized_tool_kind" ]]; then
+          SESSION_BACKEND="$backend"
+          if [[ "$normalized_tool_kind" == "read" ]]; then
+            local path lines bytes
+            path=$(echo "$line" | jq -r '.path // "unknown"' 2>/dev/null) || path="unknown"
+            lines=$(echo "$line" | jq -r '.lines // 0' 2>/dev/null) || lines=0
+            bytes=$(echo "$line" | jq -r '.bytes // 0' 2>/dev/null) || bytes=0
+            if [[ $bytes -le 0 ]]; then
+              bytes=$((lines * 100))
             fi
-            if [[ "${shell_work_edit_seen:-0}" -eq 1 ]]; then
-              log_activity "SHELL MUTATION $cmd → $edit_summary (${shell_edit_bytes}B, ~${shell_edit_tokens} write tok, includes worktree edits)"
+            BYTES_READ=$((BYTES_READ + bytes))
+            local read_tokens
+            read_tokens=$(estimate_read_tokens "$bytes" "$lines")
+            TOKEN_EST_READ=$((TOKEN_EST_READ + read_tokens))
+
+            local kb=$(echo "scale=1; $bytes / 1024" | bc 2>/dev/null || echo "$((bytes / 1024))")
+            log_activity "READ $path ($lines lines, ~${kb}KB, ~${read_tokens} tok)"
+            track_file_read "$path" "$bytes" "$lines"
+          elif [[ "$normalized_tool_kind" == "write" ]]; then
+            local path lines bytes
+            path=$(echo "$line" | jq -r '.path // "unknown"' 2>/dev/null) || path="unknown"
+            lines=$(echo "$line" | jq -r '.lines // 0' 2>/dev/null) || lines=0
+            bytes=$(echo "$line" | jq -r '.bytes // 0' 2>/dev/null) || bytes=0
+            BYTES_WRITTEN=$((BYTES_WRITTEN + bytes))
+            WRITE_CALLS=$((WRITE_CALLS + 1))
+            local write_tokens
+            write_tokens=$(estimate_write_tokens "$bytes" "$lines")
+            TOKEN_EST_WRITE=$((TOKEN_EST_WRITE + write_tokens))
+            if [[ "$path" != "$RALPH_DIR/"* ]] && [[ "$path" != ".ralph/"* ]]; then
+              WORK_WRITE_CALLS=$((WORK_WRITE_CALLS + 1))
+            fi
+
+            local kb=$(echo "scale=1; $bytes / 1024" | bc 2>/dev/null || echo "$((bytes / 1024))")
+            log_activity "WRITE $path ($lines lines, ${kb}KB, ~${write_tokens} tok)"
+            track_file_write "$path"
+            update_workspace_snapshot_entry "$path"
+          elif [[ "$normalized_tool_kind" == "shell" ]]; then
+            local cmd exit_code stdout stderr output_chars output_lines
+            cmd=$(echo "$line" | jq -r '.command // "unknown"' 2>/dev/null) || cmd="unknown"
+            exit_code=$(echo "$line" | jq -r '.exit_code // 0' 2>/dev/null) || exit_code=0
+            stdout=$(echo "$line" | jq -r '.stdout // ""' 2>/dev/null) || stdout=""
+            stderr=$(echo "$line" | jq -r '.stderr // ""' 2>/dev/null) || stderr=""
+            if [[ -z "$stdout$stderr" ]]; then
+              stdout=$(echo "$line" | jq -r '.raw_output // .content // ""' 2>/dev/null) || stdout=""
+            fi
+            SHELL_CALLS=$((SHELL_CALLS + 1))
+
+            output_chars=$((${#stdout} + ${#stderr}))
+            SHELL_OUTPUT_CHARS=$((SHELL_OUTPUT_CHARS + output_chars))
+            output_lines=0
+            if [[ -n "$stdout$stderr" ]]; then
+              output_lines=$(printf '%s' "$stdout$stderr" | awk 'END { print NR+0 }')
+            fi
+            local shell_tokens
+            shell_tokens=$(estimate_shell_tokens "$output_chars" "$output_lines")
+            TOKEN_EST_SHELL=$((TOKEN_EST_SHELL + shell_tokens))
+            track_shell_edits "$cmd" "$exit_code"
+            local shell_edit_count="$LAST_SHELL_EDIT_COUNT"
+            local shell_work_edit_seen="$LAST_SHELL_WORK_EDIT_SEEN"
+            local shell_edit_bytes="$LAST_SHELL_EDIT_BYTES"
+            local shell_edit_tokens="$LAST_SHELL_EDIT_TOKENS"
+
+            if [[ $exit_code -eq 0 ]]; then
+              if [[ $output_chars -gt 1024 ]]; then
+                log_activity "SHELL $cmd → exit 0 (${output_chars} chars, ~${shell_tokens} tok)"
+              else
+                log_activity "SHELL $cmd → exit 0 (~${shell_tokens} tok)"
+              fi
             else
-              log_activity "SHELL MUTATION $cmd → $edit_summary (${shell_edit_bytes}B, ~${shell_edit_tokens} write tok)"
+              log_activity "SHELL $cmd → exit $exit_code (~${shell_tokens} tok)"
+              track_shell_failure "$cmd" "$exit_code"
+            fi
+
+            if [[ "${shell_edit_count:-0}" -gt 0 ]]; then
+              local edit_summary="${shell_edit_count} file"
+              if [[ "${shell_edit_count:-0}" -ne 1 ]]; then
+                edit_summary="${shell_edit_count} files"
+              fi
+              if [[ "${shell_work_edit_seen:-0}" -eq 1 ]]; then
+                log_activity "SHELL MUTATION $cmd → $edit_summary (${shell_edit_bytes}B, ~${shell_edit_tokens} write tok, includes worktree edits)"
+              else
+                log_activity "SHELL MUTATION $cmd → $edit_summary (${shell_edit_bytes}B, ~${shell_edit_tokens} write tok)"
+              fi
+            fi
+          fi
+        else
+          # Handle read tool completion
+          if echo "$line" | jq -e '.tool_call.readToolCall.result.success' > /dev/null 2>&1; then
+            local path=$(echo "$line" | jq -r '.tool_call.readToolCall.args.path // "unknown"' 2>/dev/null) || path="unknown"
+            local lines=$(echo "$line" | jq -r '.tool_call.readToolCall.result.success.totalLines // 0' 2>/dev/null) || lines=0
+            
+            local content_size=$(echo "$line" | jq -r '.tool_call.readToolCall.result.success.contentSize // 0' 2>/dev/null) || content_size=0
+            local bytes
+            if [[ $content_size -gt 0 ]]; then
+              bytes=$content_size
+            else
+              bytes=$((lines * 100))  # ~100 chars/line for code
+            fi
+            BYTES_READ=$((BYTES_READ + bytes))
+            local read_tokens
+            read_tokens=$(estimate_read_tokens "$bytes" "$lines")
+            TOKEN_EST_READ=$((TOKEN_EST_READ + read_tokens))
+            
+            local kb=$(echo "scale=1; $bytes / 1024" | bc 2>/dev/null || echo "$((bytes / 1024))")
+            log_activity "READ $path ($lines lines, ~${kb}KB, ~${read_tokens} tok)"
+            track_file_read "$path" "$bytes" "$lines"
+            
+          # Handle write tool completion
+          elif echo "$line" | jq -e '.tool_call.writeToolCall.result.success' > /dev/null 2>&1; then
+            local path=$(echo "$line" | jq -r '.tool_call.writeToolCall.args.path // "unknown"' 2>/dev/null) || path="unknown"
+            local lines=$(echo "$line" | jq -r '.tool_call.writeToolCall.result.success.linesCreated // 0' 2>/dev/null) || lines=0
+            local bytes=$(echo "$line" | jq -r '.tool_call.writeToolCall.result.success.fileSize // 0' 2>/dev/null) || bytes=0
+            BYTES_WRITTEN=$((BYTES_WRITTEN + bytes))
+            WRITE_CALLS=$((WRITE_CALLS + 1))
+            local write_tokens
+            write_tokens=$(estimate_write_tokens "$bytes" "$lines")
+            TOKEN_EST_WRITE=$((TOKEN_EST_WRITE + write_tokens))
+            if [[ "$path" != "$RALPH_DIR/"* ]] && [[ "$path" != ".ralph/"* ]]; then
+              WORK_WRITE_CALLS=$((WORK_WRITE_CALLS + 1))
+            fi
+            
+            local kb=$(echo "scale=1; $bytes / 1024" | bc 2>/dev/null || echo "$((bytes / 1024))")
+            log_activity "WRITE $path ($lines lines, ${kb}KB, ~${write_tokens} tok)"
+            
+            # Track for thrashing detection
+            track_file_write "$path"
+            update_workspace_snapshot_entry "$path"
+            
+          # Handle shell tool completion
+          elif echo "$line" | jq -e '.tool_call.shellToolCall.result' > /dev/null 2>&1; then
+            local cmd=$(echo "$line" | jq -r '.tool_call.shellToolCall.args.command // "unknown"' 2>/dev/null) || cmd="unknown"
+            local exit_code=$(echo "$line" | jq -r '.tool_call.shellToolCall.result.exitCode // 0' 2>/dev/null) || exit_code=0
+            SHELL_CALLS=$((SHELL_CALLS + 1))
+            
+            local stdout=$(echo "$line" | jq -r '.tool_call.shellToolCall.result.stdout // ""' 2>/dev/null) || stdout=""
+            local stderr=$(echo "$line" | jq -r '.tool_call.shellToolCall.result.stderr // ""' 2>/dev/null) || stderr=""
+            local output_chars=$((${#stdout} + ${#stderr}))
+            SHELL_OUTPUT_CHARS=$((SHELL_OUTPUT_CHARS + output_chars))
+            local output_lines=0
+            if [[ -n "$stdout$stderr" ]]; then
+              output_lines=$(printf '%s' "$stdout$stderr" | awk 'END { print NR+0 }')
+            fi
+            local shell_tokens
+            shell_tokens=$(estimate_shell_tokens "$output_chars" "$output_lines")
+            TOKEN_EST_SHELL=$((TOKEN_EST_SHELL + shell_tokens))
+            track_shell_edits "$cmd" "$exit_code"
+            local shell_edit_count="$LAST_SHELL_EDIT_COUNT"
+            local shell_work_edit_seen="$LAST_SHELL_WORK_EDIT_SEEN"
+            local shell_edit_bytes="$LAST_SHELL_EDIT_BYTES"
+            local shell_edit_tokens="$LAST_SHELL_EDIT_TOKENS"
+            
+            if [[ $exit_code -eq 0 ]]; then
+              if [[ $output_chars -gt 1024 ]]; then
+                log_activity "SHELL $cmd → exit 0 (${output_chars} chars, ~${shell_tokens} tok)"
+              else
+                log_activity "SHELL $cmd → exit 0 (~${shell_tokens} tok)"
+              fi
+            else
+              log_activity "SHELL $cmd → exit $exit_code (~${shell_tokens} tok)"
+              track_shell_failure "$cmd" "$exit_code"
+            fi
+
+            if [[ "${shell_edit_count:-0}" -gt 0 ]]; then
+              local edit_summary="${shell_edit_count} file"
+              if [[ "${shell_edit_count:-0}" -ne 1 ]]; then
+                edit_summary="${shell_edit_count} files"
+              fi
+              if [[ "${shell_work_edit_seen:-0}" -eq 1 ]]; then
+                log_activity "SHELL MUTATION $cmd → $edit_summary (${shell_edit_bytes}B, ~${shell_edit_tokens} write tok, includes worktree edits)"
+              else
+                log_activity "SHELL MUTATION $cmd → $edit_summary (${shell_edit_bytes}B, ~${shell_edit_tokens} write tok)"
+              fi
             fi
           fi
         fi
-        
-        # Check thresholds after each tool call
+
         check_gutter
       fi
       ;;

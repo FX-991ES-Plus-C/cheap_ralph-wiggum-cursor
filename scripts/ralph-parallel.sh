@@ -273,12 +273,20 @@ Begin by reading any relevant files, then implement the task."
   mkdir -p "$worktree_dir/.ralph"
   mkdir -p "$worktree_dir/.ralph/parallel/${RUN_ID}"
   
-  # Run cursor-agent
+  # Run the selected agent backend
   echo "[$(date '+%H:%M:%S')] Agent ${display_agent_num} (job ${job_id}, task ${task_id}) starting: $task_desc" >> "$log_file"
   
   # Headless mode: auto-approve MCP servers to avoid interactive prompts.
   # Also detach stdin to prevent any accidental blocking on input.
-  if cd "$worktree_dir" && cursor-agent -p --approve-mcps --force --output-format stream-json --model "$MODEL" "$prompt" >> "$log_file" 2>&1 < /dev/null; then
+  if ! require_auto_model "$MODEL"; then
+    echo "failed" > "$status_file"
+    echo "error|0" > "$output_file"
+    echo "[$(date '+%H:%M:%S')] Agent ${display_agent_num} (job ${job_id}) refused non-auto model: $MODEL" >> "$log_file"
+  elif ! build_agent_command 1 "$MODEL"; then
+    echo "failed" > "$status_file"
+    echo "error|0" > "$output_file"
+    echo "[$(date '+%H:%M:%S')] Agent ${display_agent_num} (job ${job_id}) could not build ${AGENT_BACKEND} command" >> "$log_file"
+  elif cd "$worktree_dir" && "${RALPH_AGENT_CMD[@]}" "$prompt" >> "$log_file" 2>&1 < /dev/null; then
     echo "done" > "$status_file"
     
     # Check if any commits were made
@@ -433,6 +441,8 @@ run_parallel_tasks() {
   local max_parallel="${2:-$MAX_PARALLEL}"
   local base_branch="${3:-$(git -C "$workspace" rev-parse --abbrev-ref HEAD)}"
   local integration_branch="${4:-}"
+
+  require_supported_backend "${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}" || return 1
   
   # Prevent concurrent parallel runs from trampling worktrees/logs
   acquire_parallel_lock "$workspace" || return 1
@@ -450,6 +460,7 @@ run_parallel_tasks() {
 
   # Export for subprocesses (subshells + agent runners)
   export MODEL
+  export AGENT_BACKEND
   export BASE_SHA="$base_sha"
   export BASE_BRANCH="$base_branch"
   export RUN_ID
@@ -510,6 +521,7 @@ run_parallel_tasks() {
   echo ""
   echo "Base branch:    $base_branch"
   echo "Base SHA:       $base_sha"
+  echo "Backend:        $(format_backend_label "$AGENT_BACKEND")"
   echo "Worktree base:  $worktree_base"
   echo "Run state dir:  $RUN_DIR"
   echo ""
@@ -996,7 +1008,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     echo "  -b, --base-branch NAME  Base branch (default: current)"
     echo "  --no-merge              Skip auto-merge after completion"
     echo "  --pr                    Create PRs instead of auto-merge"
-    echo "  -m, --model MODEL       Model to use"
+    echo "  -m, --model MODEL       Model to use (must be: auto)"
+    echo "  --agent-backend NAME    Agent backend to use: cursor or qwen"
     echo "  -h, --help              Show this help"
   }
   
@@ -1025,6 +1038,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         MODEL="$2"
         shift 2
         ;;
+      --agent-backend)
+        AGENT_BACKEND="$2"
+        shift 2
+        ;;
       -h|--help)
         usage
         exit 0
@@ -1035,6 +1052,14 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         ;;
     esac
   done
+
+  if ! require_supported_backend "${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}"; then
+    exit 1
+  fi
+
+  if ! require_auto_model "$MODEL"; then
+    exit 1
+  fi
   
   # Run parallel tasks
   run_parallel_tasks "$WORKSPACE" "$MAX_PARALLEL" "${BASE_BRANCH:-}"

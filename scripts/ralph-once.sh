@@ -7,7 +7,8 @@
 # Usage:
 #   ./ralph-once.sh                    # Run single iteration
 #   ./ralph-once.sh /path/to/project   # Run in specific project
-#   ./ralph-once.sh -m gpt-5.2-high    # Use specific model
+#   ./ralph-once.sh -m auto            # Explicitly request backend auto mode
+#   ./ralph-once.sh --agent-backend qwen
 #
 # After running:
 #   - Review the changes made
@@ -17,7 +18,7 @@
 # Requirements:
 #   - RALPH_TASK.md in the project root
 #   - Git repository
-#   - cursor-agent CLI installed
+#   - supported agent CLI installed (`cursor-agent` or `qwen`)
 
 set -euo pipefail
 
@@ -41,12 +42,14 @@ Usage:
   ./ralph-once.sh [options] [workspace]
 
 Options:
-  -m, --model MODEL      Model to use (default: auto)
+  -m, --model MODEL      Model to use (must be: auto)
+  --agent-backend NAME   Agent backend to use: cursor or qwen
   -h, --help             Show this help
 
 Examples:
   ./ralph-once.sh                        # Run one iteration
-  ./ralph-once.sh -m sonnet-4.5-thinking # Use Sonnet model
+  ./ralph-once.sh -m auto               # Explicitly request backend auto mode
+  ./ralph-once.sh --agent-backend qwen  # Run one iteration with Qwen
   
 After reviewing the results:
   - If satisfied: run ./ralph-setup.sh for full loop
@@ -61,6 +64,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -m|--model)
       MODEL="$2"
+      shift 2
+      ;;
+    --agent-backend)
+      AGENT_BACKEND="$2"
       shift 2
       ;;
     -h|--help)
@@ -93,6 +100,14 @@ main() {
   else
     WORKSPACE="$(cd "$WORKSPACE" && pwd)"
   fi
+
+  if ! require_supported_backend "${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}"; then
+    exit 1
+  fi
+
+  if ! require_auto_model "$MODEL"; then
+    exit 1
+  fi
   
   local task_file="$WORKSPACE/RALPH_TASK.md"
   
@@ -116,6 +131,7 @@ main() {
   init_ralph_dir "$WORKSPACE"
   
   echo "Workspace: $WORKSPACE"
+  echo "Backend:   $(format_backend_label "$AGENT_BACKEND")"
   echo "Model:     $(format_requested_model_label "$MODEL")"
   echo ""
   

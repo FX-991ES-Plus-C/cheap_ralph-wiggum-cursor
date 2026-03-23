@@ -1,7 +1,7 @@
 #!/bin/bash
 # Ralph Wiggum: The Loop (CLI Mode)
 #
-# Runs cursor-agent locally with stream-json parsing for accurate token tracking.
+# Runs the selected agent CLI locally with stream-json parsing for accurate token tracking.
 # Handles context rotation via --resume when thresholds are hit.
 #
 # This script is for power users and scripting. For interactive use, see ralph-setup.sh.
@@ -10,6 +10,7 @@
 #   ./ralph-loop.sh                              # Start from current directory
 #   ./ralph-loop.sh /path/to/project             # Start from specific project
 #   ./ralph-loop.sh -n 50 -m auto                # Custom iterations in auto mode
+#   ./ralph-loop.sh --agent-backend qwen         # Use Qwen instead of Cursor
 #   ./ralph-loop.sh --branch feature/foo --pr   # Create branch and PR
 #   ./ralph-loop.sh -y                           # Skip confirmation (for scripting)
 #
@@ -28,7 +29,7 @@
 # Requirements:
 #   - RALPH_TASK.md in the project root
 #   - Git repository
-#   - cursor-agent CLI installed
+#   - supported agent CLI installed (`cursor-agent` or `qwen`)
 
 set -euo pipefail
 
@@ -57,6 +58,7 @@ Usage:
 Options:
   -n, --iterations N     Max iterations (default: 20)
   -m, --model MODEL      Model to use (must be: auto)
+  --agent-backend NAME   Agent backend to use: cursor or qwen
   --branch NAME          Sequential: create/work on branch; Parallel: integration branch name
   --pr                   Sequential: open PR (requires --branch); Parallel: open ONE integration PR (branch optional)
   --parallel             Run tasks in parallel with worktrees
@@ -69,13 +71,15 @@ Options:
 Examples:
   ./ralph-loop.sh                                    # Interactive mode
   ./ralph-loop.sh -n 50                              # 50 iterations max
-  ./ralph-loop.sh -m auto                            # Explicitly request Cursor Auto
+  ./ralph-loop.sh -m auto                            # Explicitly request backend auto mode
+  ./ralph-loop.sh --agent-backend qwen               # Use Qwen
   ./ralph-loop.sh --branch feature/api --pr -y      # Scripted PR workflow
   ./ralph-loop.sh --parallel --max-parallel 4        # Run 4 agents in parallel
   ./ralph-loop.sh --dashboard -y                     # Launch with live dashboard
   
 Environment:
   RALPH_MODEL            Override default model (must be: auto)
+  RALPH_AGENT_BACKEND    Override backend (`cursor` or `qwen`)
   MAX_CONSECUTIVE_THRASH_RECOVERIES
                          Auto-restart full loop after THRASH STOP (default: 2)
   THRASH_RECOVERY_DELAY_SECONDS
@@ -102,6 +106,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     -m|--model)
       MODEL="$2"
+      shift 2
+      ;;
+    --agent-backend)
+      AGENT_BACKEND="$2"
       shift 2
       ;;
     --branch)
@@ -164,6 +172,10 @@ main() {
     WORKSPACE="$(cd "$WORKSPACE" && pwd)"
   fi
 
+  if ! require_supported_backend "${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}"; then
+    exit 1
+  fi
+
   if ! require_auto_model "$MODEL"; then
     exit 1
   fi
@@ -173,6 +185,7 @@ main() {
     write_runtime_state "$WORKSPACE" "starting" "$(get_iteration "$WORKSPACE")" "$MODEL" "NONE" "Dashboard launching" "loop" ""
     local -a dashboard_args
     dashboard_args=(-n "$MAX_ITERATIONS" -m "$MODEL" -y)
+    dashboard_args+=(--agent-backend "$AGENT_BACKEND")
     [[ -n "$USE_BRANCH" ]] && dashboard_args+=(--branch "$USE_BRANCH")
     [[ "$OPEN_PR" == "true" ]] && dashboard_args+=(--pr)
     if [[ "$PARALLEL_MODE" == "true" ]]; then
@@ -208,6 +221,7 @@ main() {
   
   echo "Workspace: $WORKSPACE"
   echo "Task:      $task_file"
+  echo "Backend:   $(format_backend_label "$AGENT_BACKEND")"
   echo ""
   
   # Show task summary
@@ -240,7 +254,7 @@ main() {
   
   # Confirm before starting (unless -y flag)
   if [[ "$SKIP_CONFIRM" != "true" ]]; then
-    echo "This will run cursor-agent locally to work on this task."
+    echo "This will run $(agent_binary_name "$AGENT_BACKEND") locally to work on this task."
     echo "The agent will be rotated when context fills up (~80k tokens)."
     echo ""
     echo "Tip: Use ralph-setup.sh for interactive model/option selection."

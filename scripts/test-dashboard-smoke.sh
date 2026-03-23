@@ -59,6 +59,7 @@ EOF
 # Ralph runtime state
 RALPH_RUNTIME_STATUS=running
 RALPH_RUNTIME_ITERATION=1
+RALPH_RUNTIME_BACKEND=cursor
 RALPH_RUNTIME_MODEL=auto
 RALPH_RUNTIME_LAST_SIGNAL=WARN
 RALPH_RUNTIME_LAST_EVENT=Context\ warning\ issued
@@ -69,6 +70,7 @@ EOF
 
   cat > "$dir/.ralph/.last-session.env" <<'EOF'
 RALPH_SESSION_ITERATION=1
+RALPH_SESSION_BACKEND=cursor
 RALPH_SESSION_ID=cursor-session-123
 RALPH_SESSION_REQUEST_ID=request-456
 RALPH_SESSION_PERMISSION_MODE=default
@@ -620,6 +622,69 @@ EOF
   fi
 }
 
+run_qwen_normalizer_parser_case() {
+  local workspace
+  workspace="$(make_workspace)"
+
+  printf '%s\n' \
+    '{"type":"system","subtype":"init","model":"qwen3.5-plus","session_id":"qwen-session-parser","permission_mode":"yolo"}' \
+    '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"read-1","name":"read_file","input":{"path":"src/qwen.ts"}}]}}' \
+    '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"read-1","content":"line one\nline two"}]}}' \
+    '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"shell-1","name":"run_shell_command","input":{"command":"pnpm test"}}]}}' \
+    '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"shell-1","is_error":true,"content":"fail"}]}}' \
+    | bash "$REPO_DIR/scripts/agent-normalizer.sh" qwen "$workspace" \
+    | WARN_THRESHOLD=999999 ROTATE_THRESHOLD=999999 bash "$REPO_DIR/scripts/stream-parser.sh" "$workspace" >"$workspace/parser.out"
+
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_BACKEND=qwen"
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_ID=qwen-session-parser"
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_PERMISSION_MODE=yolo"
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_MODEL=qwen3.5-plus"
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_READ_CALLS=1"
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_SHELL_CALLS=1"
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_TOOL_CALLS=2"
+  assert_contains "$workspace/.ralph/activity.log" "READ src/qwen.ts"
+  assert_contains "$workspace/.ralph/activity.log" "SHELL pnpm test → exit 1"
+  assert_contains "$workspace/.ralph/errors.log" "SHELL FAIL: pnpm test → exit 1 (attempt 1)"
+}
+
+run_qwen_auto_backend_case() {
+  local workspace fakebin signal
+  workspace="$(make_workspace)"
+  fakebin="$workspace/fakebin"
+  mkdir -p "$fakebin"
+
+  cat > "$fakebin/qwen" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$@" > "$TEST_ARG_FILE"
+printf '%s\n' '{"type":"system","subtype":"init","model":"qwen3.5-plus","session_id":"qwen-session-auto","permission_mode":"yolo"}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"<ralph>COMPLETE</ralph>"}]}}'
+printf '%s\n' '{"type":"result","subtype":"success","result":"OK","session_id":"qwen-session-auto"}'
+EOF
+  chmod +x "$fakebin/qwen"
+
+  (
+    export PATH="$fakebin:$PATH"
+    export TEST_ARG_FILE="$workspace/qwen-args.txt"
+    export MODEL=auto
+    export AGENT_BACKEND=qwen
+    export SCRIPT_DIR="$REPO_DIR/scripts"
+    # shellcheck disable=SC1090
+    source "$REPO_DIR/scripts/ralph-common.sh"
+    init_ralph_dir "$workspace"
+    signal="$(run_iteration "$workspace" 1 "$REPO_DIR/scripts")"
+    [[ "$signal" == "COMPLETE" ]]
+  ) 2>"$workspace/run.stderr"
+
+  assert_not_contains "$workspace/qwen-args.txt" "--model"
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_BACKEND=qwen"
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_ID=qwen-session-auto"
+  assert_contains "$workspace/.ralph/.last-session.env" "RALPH_SESSION_PERMISSION_MODE=yolo"
+  assert_contains "$workspace/.ralph/runtime.env" "RALPH_RUNTIME_BACKEND=qwen"
+  assert_contains "$workspace/.ralph/signals.log" "signal=SESSION_START model=qwen3.5-plus | session=qwen-session-auto permission=yolo backend=qwen requested_model=auto"
+  assert_contains "$workspace/run.stderr" "Backend:   Qwen"
+  assert_contains "$workspace/run.stderr" "Model:     auto (Qwen default model)"
+}
+
 run_signal_timeline_case() {
   local workspace
   workspace="$(make_workspace)"
@@ -650,7 +715,7 @@ assert ns["signal_from_line"](
 ) == "LOOP_START"
 assert state.signal_timeline[-5:] == ["SESSION_REQUESTED", "SESSION_START", "LOOP_START", "THRASH", "ABORT"], state.signal_timeline
 assert state.latest_signals[-1].endswith("Agent launch/runtime failure"), state.latest_signals
-assert ns["cursor_session_summary"](state) == "session cursor-session-123 | req request-456 | perm default"
+assert ns["cursor_session_summary"](state) == "cursor | session cursor-session-123 | req request-456 | perm default"
 PY
 }
 
@@ -1043,7 +1108,7 @@ main() {
   assert_contains "$snapshot_file" "Views:"
   assert_contains "$snapshot_file" "Dashboard shows current task state"
   assert_contains "$snapshot_file" "Timeline:"
-  assert_contains "$snapshot_file" "Cursor: session cursor-session-123 | req request-456 | perm default"
+  assert_contains "$snapshot_file" "Agent: cursor | session cursor-session-123 | req request-456 | perm default"
   assert_contains "$snapshot_file" "Model: test-model"
   assert_contains "$snapshot_file" "Telemetry: reads 1 (0B)  writes 0 (0B)  shell 0  tools 1"
   assert_contains "$snapshot_file" "Token Mix: prompt 480, read 120, write 60, assist 90, shell 10, tools 12"
@@ -1118,6 +1183,8 @@ PY
   assert_contains "$gutter_rotate_workspace/.ralph/.last-session.env" "RALPH_SESSION_SIGNAL=ROTATE"
 
   run_auto_model_case
+  run_qwen_normalizer_parser_case
+  run_qwen_auto_backend_case
   run_live_abort_case
   run_auto_policy_violation_case
   run_tui_spinner_suppression_case

@@ -68,7 +68,9 @@ SEQUENTIAL_LOCK_HELD="${SEQUENTIAL_LOCK_HELD:-}"
 
 # Model selection
 DEFAULT_MODEL="auto"
-MODEL="${RALPH_MODEL:-$DEFAULT_MODEL}"
+MODEL="${MODEL:-${RALPH_MODEL:-$DEFAULT_MODEL}}"
+DEFAULT_AGENT_BACKEND="cursor"
+AGENT_BACKEND="${AGENT_BACKEND:-${RALPH_AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}}"
 
 # Feature flags (set by caller)
 USE_BRANCH="${USE_BRANCH:-}"
@@ -159,13 +161,116 @@ normalize_model_name() {
   printf '%s' "$model" | tr '[:upper:]' '[:lower:]'
 }
 
+normalize_backend_name() {
+  local backend="${1:-}"
+  printf '%s' "$backend" | tr '[:upper:]' '[:lower:]'
+}
+
+format_backend_label() {
+  local backend="${1:-${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}}"
+
+  case "$(normalize_backend_name "$backend")" in
+    "cursor")
+      printf '%s\n' "Cursor"
+      ;;
+    "qwen")
+      printf '%s\n' "Qwen"
+      ;;
+    *)
+      printf '%s\n' "$backend"
+      ;;
+  esac
+}
+
+agent_binary_name() {
+  local backend="${1:-${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}}"
+
+  case "$(normalize_backend_name "$backend")" in
+    "cursor")
+      printf '%s\n' "cursor-agent"
+      ;;
+    "qwen")
+      printf '%s\n' "qwen"
+      ;;
+    *)
+      printf '%s\n' ""
+      ;;
+  esac
+}
+
+agent_install_hint() {
+  local backend="${1:-${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}}"
+
+  case "$(normalize_backend_name "$backend")" in
+    "cursor")
+      printf '%s\n' "curl https://cursor.com/install -fsS | bash"
+      ;;
+    "qwen")
+      printf '%s\n' "https://qwenlm.github.io/qwen-code-docs/en/getting-started/install/"
+      ;;
+    *)
+      printf '%s\n' ""
+      ;;
+  esac
+}
+
+require_supported_backend() {
+  local requested_backend="${1:-${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}}"
+  local normalized_backend
+  normalized_backend=$(normalize_backend_name "$requested_backend")
+
+  case "$normalized_backend" in
+    "cursor"|"qwen")
+      AGENT_BACKEND="$normalized_backend"
+      export RALPH_AGENT_BACKEND="$AGENT_BACKEND"
+      return 0
+      ;;
+    *)
+      echo "❌ Unsupported Ralph agent backend: $requested_backend" >&2
+      echo "   Supported backends: cursor, qwen" >&2
+      return 1
+      ;;
+  esac
+}
+
+build_agent_command() {
+  local headless_mode="${1:-0}"
+  local requested_model="${2:-${MODEL:-$DEFAULT_MODEL}}"
+
+  require_supported_backend "${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}" || return 1
+
+  RALPH_AGENT_CMD=()
+
+  case "$AGENT_BACKEND" in
+    "cursor")
+      RALPH_AGENT_CMD=(cursor-agent -p --force --output-format stream-json)
+      if [[ "$headless_mode" == "1" ]]; then
+        RALPH_AGENT_CMD=(cursor-agent -p --approve-mcps --force --output-format stream-json)
+      fi
+      if [[ -n "$requested_model" ]]; then
+        RALPH_AGENT_CMD+=(--model "$requested_model")
+      fi
+      ;;
+    "qwen")
+      RALPH_AGENT_CMD=(qwen -p --output-format stream-json --approval-mode yolo)
+      if [[ -n "$requested_model" ]] && [[ "$(normalize_model_name "$requested_model")" != "auto" ]]; then
+        RALPH_AGENT_CMD+=(--model "$requested_model")
+      fi
+      ;;
+    *)
+      echo "❌ Unsupported Ralph agent backend: $AGENT_BACKEND" >&2
+      return 1
+      ;;
+  esac
+}
+
 require_auto_model() {
   local requested_model="${1:-${MODEL:-$DEFAULT_MODEL}}"
   local normalized_model
   normalized_model=$(normalize_model_name "$requested_model")
 
   if [[ "$normalized_model" != "auto" ]]; then
-    echo "❌ Ralph is locked to Cursor CLI auto mode only. Refusing model: $requested_model" >&2
+    echo "❌ Ralph is currently locked to backend-default auto mode only. Refusing model: $requested_model" >&2
     return 1
   fi
 
@@ -179,6 +284,7 @@ load_last_session_metrics() {
   local summary_file="$workspace/.ralph/.last-session.env"
 
   RALPH_SESSION_ITERATION=0
+  RALPH_SESSION_BACKEND=""
   RALPH_SESSION_ID=""
   RALPH_SESSION_REQUEST_ID=""
   RALPH_SESSION_PERMISSION_MODE=""
@@ -230,6 +336,7 @@ initialize_session_metrics() {
 
   {
     printf 'RALPH_SESSION_ITERATION=%q\n' "$iteration"
+    printf 'RALPH_SESSION_BACKEND=%q\n' "${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}"
     printf 'RALPH_SESSION_ID=%q\n' ""
     printf 'RALPH_SESSION_REQUEST_ID=%q\n' ""
     printf 'RALPH_SESSION_PERMISSION_MODE=%q\n' ""
@@ -285,11 +392,42 @@ resolve_runtime_model() {
   fi
 }
 
+resolve_runtime_backend() {
+  local workspace="${1:-.}"
+  local iteration="${2:-}"
+  local fallback="${3:-${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}}"
+
+  load_last_session_metrics "$workspace"
+  if [[ -n "${RALPH_SESSION_BACKEND:-}" ]] && [[ -n "$iteration" ]] && [[ "${RALPH_SESSION_ITERATION:-}" == "$iteration" ]]; then
+    printf '%s\n' "$RALPH_SESSION_BACKEND"
+    return
+  fi
+
+  if [[ -n "$fallback" ]]; then
+    printf '%s\n' "$fallback"
+  else
+    printf '%s\n' "$DEFAULT_AGENT_BACKEND"
+  fi
+}
+
 format_requested_model_label() {
   local model="${1:-${MODEL:-unknown}}"
+  local backend="${2:-${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}}"
+  local normalized_backend
+  normalized_backend=$(normalize_backend_name "$backend")
 
   if [[ "$model" == "auto" ]]; then
-    printf '%s\n' "auto (Cursor will resolve)"
+    case "$normalized_backend" in
+      "cursor")
+        printf '%s\n' "auto (Cursor will resolve)"
+        ;;
+      "qwen")
+        printf '%s\n' "auto (Qwen default model)"
+        ;;
+      *)
+        printf '%s\n' "auto (backend default)"
+        ;;
+    esac
   elif [[ -n "$model" ]]; then
     printf '%s\n' "$model"
   else
@@ -345,18 +483,22 @@ write_runtime_state() {
   local last_event="${6:-Waiting for Ralph}"
   local mode="${7:-sequential}"
   local agent_pid="${8:-}"
+  local backend="${9:-${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}}"
   local state_file="$workspace/.ralph/runtime.env"
   local resolved_model
+  local resolved_backend
   local tmp_file
 
   mkdir -p "$workspace/.ralph"
   resolved_model=$(resolve_runtime_model "$workspace" "$iteration" "$model")
+  resolved_backend=$(resolve_runtime_backend "$workspace" "$iteration" "$backend")
   tmp_file=$(mktemp)
 
   {
     echo "# Ralph runtime state"
     printf 'RALPH_RUNTIME_STATUS=%q\n' "$status"
     printf 'RALPH_RUNTIME_ITERATION=%q\n' "$iteration"
+    printf 'RALPH_RUNTIME_BACKEND=%q\n' "$resolved_backend"
     printf 'RALPH_RUNTIME_MODEL=%q\n' "$resolved_model"
     printf 'RALPH_RUNTIME_LAST_SIGNAL=%q\n' "$last_signal"
     printf 'RALPH_RUNTIME_LAST_EVENT=%q\n' "$last_event"
@@ -2389,6 +2531,7 @@ run_iteration() {
   local iteration="$2"
   local script_dir="${3:-$(dirname "${BASH_SOURCE[0]}")}"
 
+  require_supported_backend "${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}" || return 1
   require_auto_model "$MODEL" || return 1
   auto_rotate_ralph_logs_if_needed "$workspace"
   load_last_session_metrics "$workspace"
@@ -2413,6 +2556,7 @@ run_iteration() {
   echo "═══════════════════════════════════════════════════════════════════" >&2
   echo "" >&2
   echo "Workspace: $workspace" >&2
+  echo "Backend:   $(format_backend_label "$AGENT_BACKEND")" >&2
   echo "Model:     $(format_requested_model_label "$MODEL")" >&2
   echo "Monitor:   tail -f $workspace/.ralph/activity.log" >&2
   echo "" >&2
@@ -2420,12 +2564,10 @@ run_iteration() {
   # Log session start to progress.md
   log_progress "$workspace" "**Session $iteration started** (model request: $(format_requested_model_label "$MODEL"))"
   
-  # Build cursor-agent command
+  # Build agent command
   local -a agent_cmd
-  agent_cmd=(cursor-agent -p --force --output-format stream-json)
-  if [[ -n "${MODEL:-}" ]]; then
-    agent_cmd+=(--model "$MODEL")
-  fi
+  build_agent_command 0 "$MODEL" || return 1
+  agent_cmd=("${RALPH_AGENT_CMD[@]}")
 
   # Change to workspace
   cd "$workspace"
@@ -2439,7 +2581,7 @@ run_iteration() {
     spinner_pid=$!
   fi
   
-  # Start parser in background, reading from cursor-agent
+  # Start parser in background, reading from the selected agent backend
   # Parser outputs to fifo, we read signals from fifo
   (
     export LARGE_READ_THRESHOLD_BYTES="$LARGE_READ_THRESHOLD_BYTES"
@@ -2449,7 +2591,10 @@ run_iteration() {
     export MAX_LARGE_READS_WITHOUT_WRITE="$MAX_LARGE_READS_WITHOUT_WRITE"
     export RALPH_ITERATION="$iteration"
     export RALPH_MODEL_RUNTIME="$MODEL"
-    "${agent_cmd[@]}" "$prompt" 2>&1 | "$script_dir/stream-parser.sh" "$workspace" > "$fifo"
+    export RALPH_AGENT_BACKEND="$AGENT_BACKEND"
+    "${agent_cmd[@]}" "$prompt" 2>&1 \
+      | "$script_dir/agent-normalizer.sh" "$AGENT_BACKEND" "$workspace" \
+      | "$script_dir/stream-parser.sh" "$workspace" > "$fifo"
   ) &
   local agent_pid=$!
   write_runtime_state "$workspace" "running" "$iteration" "$MODEL" "NONE" "Session $iteration running" "sequential" "$agent_pid"
@@ -2912,12 +3057,15 @@ check_prerequisites() {
 
   print_task_scaffolding_warnings "$workspace"
 
-  # Check for cursor-agent CLI
-  if ! command -v cursor-agent &> /dev/null; then
-    echo "❌ cursor-agent CLI not found"
+  require_supported_backend "${AGENT_BACKEND:-$DEFAULT_AGENT_BACKEND}" || return 1
+
+  local agent_binary
+  agent_binary=$(agent_binary_name "$AGENT_BACKEND")
+  if [[ -z "$agent_binary" ]] || ! command -v "$agent_binary" &> /dev/null; then
+    echo "❌ $(format_backend_label "$AGENT_BACKEND") CLI not found: ${agent_binary:-unknown}"
     echo ""
     echo "Install via:"
-    echo "  curl https://cursor.com/install -fsS | bash"
+    echo "  $(agent_install_hint "$AGENT_BACKEND")"
     return 1
   fi
   
@@ -2979,6 +3127,7 @@ show_task_summary() {
   remaining=$((total_criteria - done_criteria))
   
   echo "Progress: $done_criteria / $total_criteria criteria complete ($remaining remaining)"
+  echo "Backend:  $(format_backend_label "$AGENT_BACKEND")"
   echo "Model:    $(format_requested_model_label "$MODEL")"
   echo ""
   
